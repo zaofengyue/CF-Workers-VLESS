@@ -153,9 +153,10 @@ export default {
             const url = new URL(request.url);
             const pathname = url.pathname;
             let pathProxyIP = null;
-            if (pathname.startsWith('/proxyip=')) {
+            const matchProxy = pathname.match(/\/(?:proxyip|fd|ld)=([^/?&#]+)/i);
+            if (matchProxy) {
                 try {
-                    pathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
+                    pathProxyIP = decodeURIComponent(matchProxy[1]).trim();
                 } catch (e) {
                     // 忽略错误
                 }
@@ -172,16 +173,13 @@ export default {
             }
 
             if (request.headers.get('Upgrade') === 'websocket') {
-                let wsPathProxyIP = null;
-                if (pathname.startsWith('/proxyip=')) {
-                    try {
-                        wsPathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
-                    } catch (e) {
-                        // 忽略错误
-                    }
-                }
-                
-                const customProxyIP = wsPathProxyIP || url.searchParams.get('proxyip') || request.headers.get('proxyip');
+                const customProxyIP = pathProxyIP || 
+                    url.searchParams.get('fd') || 
+                    url.searchParams.get('ld') || 
+                    url.searchParams.get('proxyip') || 
+                    request.headers.get('fd') || 
+                    request.headers.get('ld') || 
+                    request.headers.get('proxyip');
                 return await handleVlsRequest(request, customProxyIP);
             } else if (request.method === 'GET') {
                 if (url.pathname === '/') {

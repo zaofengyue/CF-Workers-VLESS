@@ -141,6 +141,41 @@ function base64ToArray(b64Str) {
     }
 }
 
+/**
+ * 解析并合并优选 IP 列表 (支持纯文本 IP/域名以及远程 Gist / http(s) 链接自动拉取合并)
+ * @param {string[]} cfipList
+ * @returns {Promise<string[]>}
+ */
+async function resolveCfipList(cfipList) {
+    if (!Array.isArray(cfipList) || cfipList.length === 0) return [];
+    const resolved = [];
+    for (const item of cfipList) {
+        const trimmed = String(item).trim();
+        if (!trimmed || trimmed.startsWith('//')) continue;
+        if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+            try {
+                const resp = await fetch(trimmed, {
+                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Cloudflare-Worker)' }
+                });
+                if (resp.ok) {
+                    const text = await resp.text();
+                    const lines = text.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
+                    for (const line of lines) {
+                        if (line && !line.startsWith('#') && !line.startsWith('//')) {
+                            resolved.push(line);
+                        }
+                    }
+                }
+            } catch (err) {
+                // 网络异常跳过或记录
+            }
+        } else {
+            resolved.push(trimmed);
+        }
+    }
+    return resolved.length > 0 ? resolved : cfipList;
+}
+
 function parsePryAddress(serverStr) {
     if (!serverStr) return null;
     serverStr = serverStr.trim();
@@ -401,9 +436,9 @@ export default {
                 });
             }
 
-            // 3. 路径中 proxyip 处理
+            // 3. 路径中 proxyip / fd (分流代理) / ld (落地代理) 处理
             let pathProxyIP = null;
-            const proxyIpMatch = pathname.match(/\/proxyip=([^/?&#]+)/i);
+            const proxyIpMatch = pathname.match(/\/(?:proxyip|fd|ld)=([^/?&#]+)/i);
             if (proxyIpMatch) {
                 try {
                     pathProxyIP = decodeURIComponent(proxyIpMatch[1]).trim();
@@ -416,12 +451,24 @@ export default {
                 } catch (e) {
                     // 忽略错误
                 }
+            } else if (pathname.startsWith('/fd=')) {
+                try {
+                    pathProxyIP = decodeURIComponent(pathname.substring(4)).trim();
+                } catch (e) {
+                    // 忽略错误
+                }
+            } else if (pathname.startsWith('/ld=')) {
+                try {
+                    pathProxyIP = decodeURIComponent(pathname.substring(4)).trim();
+                } catch (e) {
+                    // 忽略错误
+                }
             }
 
             if (pathProxyIP && !request.headers.get('Upgrade')) {
                 config.proxyIP = pathProxyIP;
                 proxyIP = pathProxyIP;
-                return new Response(`set proxyIP to: ${proxyIP}\n\n`, {
+                return new Response(`set proxyIP/fd/ld to: ${proxyIP}\n\n`, {
                     headers: { 
                         'Content-Type': 'text/plain; charset=utf-8',
                         'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
@@ -431,7 +478,13 @@ export default {
 
             // 4. WebSocket 连接
             if (request.headers.get('Upgrade') === 'websocket') {
-                const customProxyIP = pathProxyIP || url.searchParams.get('proxyip') || request.headers.get('proxyip');
+                const customProxyIP = pathProxyIP || 
+                    url.searchParams.get('fd') || 
+                    url.searchParams.get('ld') || 
+                    url.searchParams.get('proxyip') || 
+                    request.headers.get('fd') || 
+                    request.headers.get('ld') || 
+                    request.headers.get('proxyip');
                 return await handleVlsRequest(request, customProxyIP, validSSPath);
             } else if (request.method === 'GET') {
                 // 5. 后台管理页面 (/admin - 需 ADMIN 密码验证)
@@ -451,8 +504,11 @@ export default {
                     const troHeader = 't' + 'r' + 'o' + 'j' + 'a' + 'n';
                     const ssHeader = 's' + 's';
                     
+                    // 解析优选节点 (支持本地列表与远程 Gist / URL 订阅自动拉取合并)
+                    const resolvedCfip = await resolveCfipList(config.cfip);
+
                     // 生成 VLESS 节点
-                    const vlsLinks = config.cfip.map(cdnItem => {
+                    const vlsLinks = resolvedCfip.map(cdnItem => {
                         let host, port = 443, nodeName = '';
                         if (cdnItem.includes('#')) {
                             const parts = cdnItem.split('#');
@@ -480,7 +536,7 @@ export default {
                     // 生成 Trojan 节点
                     let troLinks = [];
                     if (!config.disabletro) {
-                        troLinks = config.cfip.map(cdnItem => {
+                        troLinks = resolvedCfip.map(cdnItem => {
                             let host, port = 443, nodeName = '';
                             if (cdnItem.includes('#')) {
                                 const parts = cdnItem.split('#');
@@ -512,7 +568,7 @@ export default {
                         const method = 'none';
                         const ssConfig = `${method}:${config.yourUUID}`;
                         const encodedConfig = btoa(ssConfig);
-                        ssLinks = config.cfip.map(cdnItem => {
+                        ssLinks = resolvedCfip.map(cdnItem => {
                             let host, port = 443, nodeName = '';
                             if (cdnItem.includes('#')) {
                                 const parts = cdnItem.split('#');
@@ -2460,22 +2516,22 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 </div>
             </div>
 
-            <!-- ProxyIP 落地出站设置 -->
+            <!-- ProxyIP / 落地出站设置 -->
             <div class="config-card">
-                <h3><i class="fas fa-server"></i> 落地代理 ProxyIP 出站设置</h3>
+                <h3><i class="fas fa-server"></i> 出站代理设置 (fd= 分流代理 / ld= 落地代理)</h3>
                 <div class="form-group">
-                    <label for="cfg-proxyip">ProxyIP 服务器地址</label>
-                    <input type="text" id="cfg-proxyip" class="form-input" value="${config.proxyIP}" placeholder="例如: proxy.xxxxxxxx.tk:50001">
-                    <span class="form-hint">支持：<code>IP:端口</code>、<code>域名:端口</code>、<code>socks5://user:pass@host:port</code> 或 <code>http://user:pass@host:port</code></span>
+                    <label for="cfg-proxyip">出站代理服务器地址 (fd / ld / proxyip)</label>
+                    <input type="text" id="cfg-proxyip" class="form-input" value="${config.proxyIP}" placeholder="例如: proxy.xxxxxxxx.tk:50001 或 socks5://user:pass@host:port">
+                    <span class="form-hint">支持：<code>IP:端口</code>、<code>域名:端口</code>、<code>socks5://user:pass@host:port</code> 或 <code>http://user:pass@host:port</code><br>支持参数：分流代理 <code>fd=</code>、落地代理 <code>ld=</code>、兼容 <code>proxyip=</code></span>
                 </div>
             </div>
 
             <!-- 优选节点列表 -->
             <div class="config-card">
-                <h3><i class="fas fa-bolt"></i> 优选 CDN 域名与 IP 列表 (每行一个)</h3>
+                <h3><i class="fas fa-bolt"></i> 优选 CDN 域名、IP 列表或远程订阅链接 (每行一个)</h3>
                 <div class="form-group">
-                    <textarea id="cfg-cfip" class="form-textarea" rows="7" placeholder="格式支持:&#10;域名:端口#名称&#10;IP:端口#名称&#10;[IPv6]:端口#名称&#10;域名#名称">${config.cfip.join('\n')}</textarea>
-                    <span class="form-hint">格式：<code>优选域名:端口#节点名称</code> 或 <code>优选IP:端口#节点名称</code>，将自动生成在订阅中</span>
+                    <textarea id="cfg-cfip" class="form-textarea" rows="7" placeholder="格式支持:&#10;优选域名:端口#名称&#10;优选IP:端口#名称&#10;[IPv6]:端口#名称&#10;https://gist.githubusercontent.com/.../raw/... (远程文本订阅链接)">${config.cfip.join('\n')}</textarea>
+                    <span class="form-hint">支持填入 <code>优选域名:端口#节点名称</code>、<code>优选IP:端口#名称</code>，或直接填入 <code>https://...</code> 远程文本订阅/Gist Raw 链接（将自动抓取展开合并到订阅中）</span>
                 </div>
             </div>
 

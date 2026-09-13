@@ -83,13 +83,19 @@
 ### 相关路径说明
 <img width="700" height="600" alt="image" src="https://github.com/user-attachments/assets/86b3dd1d-bbca-4786-9bb3-430bf6700024" />
 
+> **参数说明**：
+> - `fd=`：**分流代理** (Forward Proxy / IP proxy)
+> - `ld=`：**落地代理** (Landing Proxy / socks5 / http)
+> - `proxyip=`：向前兼容保留的原参数名，效果与 `fd=` / `ld=` 相同
+
 | 类型 | 示例 | 说明 |
 |------|------|------|
-| **默认路径** | `/?ed=2560` | 使用代码里设置的默认 `proxyip` |
-| **域名 proxyip** | `/?ed=2560&proxyip=proxyip.domain.com` 或 `proxyip=proxyip.domain.com`  | 使用域名形式的 `proxyip` |
-| **带端口的 proxyip** | `/?ed=2560&proxyip=ip:port` 或 `/proxyip=ip:port` | 使用带端口的 `proxyip` |
-| **SOCKS5** | `/?ed=2560&proxyip=socks://user:pass@host:port` 或 `/proxyip=socks://user:pass@host:port` | 使用全局 SOCKS5 出站 协议头可为socks5 |
-| **HTTP** | `/?ed=2560&proxyip=http://user:pass@host:port` 或 `/proxyip=http://user:pass@host:port` | 使用全局 HTTP/HTTPS 出站 |
+| **默认路径** | `/?ed=2560` | 使用代码/KV里设置的默认代理 |
+| **域名出站 (分流 fd)** | `/?ed=2560&fd=proxyip.domain.com` 或 `/fd=proxyip.domain.com` | 使用域名形式的分流代理 |
+| **带端口出站 (分流 fd)** | `/?ed=2560&fd=ip:port` 或 `/fd=ip:port` | 使用带端口的分流代理 |
+| **SOCKS5 落地代理 (ld)** | `/?ed=2560&ld=socks5://user:pass@host:port` 或 `/ld=socks5://user:pass@host:port` | 使用全局 SOCKS5 落地出站 (支持 socks/socks5) |
+| **HTTP 落地代理 (ld)** | `/?ed=2560&ld=http://user:pass@host:port` 或 `/ld=http://user:pass@host:port` | 使用全局 HTTP/HTTPS 落地出站 |
+| **兼容老参数 proxyip** | `/?ed=2560&proxyip=...` 或 `/proxyip=...` | 向下兼容原有配置 |
 
 
 ## cloudns 双向解析域名部署snippets统一使用的域名前缀
@@ -100,11 +106,27 @@ _acme-challenge
 ## shadowsocks 节点参数对照图
 节点path为SSpath变量或uuid开头，示例：`/5dc15e15-f285-4a9d-959b-0e4fbdd77b63/?ed=2560`   
 
-带proxyip的示例：`/5dc15e15-f285-4a9d-959b-0e4fbdd77b63/?ed=2560&proxyip=xxxx`  v2rayN上设置全局socks5或http出站
+带落地代理的示例：`/5dc15e15-f285-4a9d-959b-0e4fbdd77b63/?ed=2560&ld=socks5://xxxx` 或 `&fd=xxxx`
 
-小火箭示例: `/5dc15e15-f285-4a9d-959b-0e4fbdd77b63/proxyip=xxxx` 设置socks5或http全局出站,karing,nekobox一样设置
+小火箭示例: `/5dc15e15-f285-4a9d-959b-0e4fbdd77b63/ld=socks5://xxxx` 设置socks5或http全局出站,karing,nekobox一样设置
+
+
+## 优选远程订阅 / Gist 文本链接支持
+在后台管理面板（或环境变量 `CFIP`）中，优选列表不仅支持填入普通节点：
+```text
+优选域名:端口#节点备注
+优选IP:端口#节点备注
+[IPv6]:端口#节点备注
+```
+还**原生支持填入远程文本链接**（如 GitHub Gist Raw 链接、远程优选订阅文本等）：
+```text
+https://gist.githubusercontent.com/username/.../raw/cfip.txt
+https://example.com/best_cf_ips.txt
+```
+系统在拉取订阅时会自动抓取该链接中的文本，自动展开并与其它优选节点合并，无需手动频繁更新优选 IP。
 
 
 ## 许可证
 
 GPL 2.0
+
