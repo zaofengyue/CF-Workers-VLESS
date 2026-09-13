@@ -6,7 +6,7 @@
 
 **中文** | [English](README_EN.md)
 
-Telegram交流反馈群组: https://t.me/eooceu
+Telegram交流反馈群组: https://t.me/eooceu | [ProxyIP 检测](https://proxy.fengyue.bond) | [Socks5 检测](https://socks.fengyue.bond)
 
 基于 Cloudflare Workers & Snippets 的高性能 VLESS+trojan+shadowsocks 代理服务
 
