@@ -95,6 +95,8 @@
 | **带端口出站 (分流 fd)** | `/?ed=2560&fd=ip:port` 或 `/fd=ip:port` | 使用带端口的分流代理 |
 | **SOCKS5 落地代理 (ld)** | `/?ed=2560&ld=socks5://user:pass@host:port` 或 `/ld=socks5://user:pass@host:port` | 使用全局 SOCKS5 落地出站 (支持 socks/socks5) |
 | **HTTP 落地代理 (ld)** | `/?ed=2560&ld=http://user:pass@host:port` 或 `/ld=http://user:pass@host:port` | 使用全局 HTTP/HTTPS 落地出站 |
+| **SoftEther (SSTP) 落地代理 (ld)** | `/?ed=2560&ld=sstp://host:443` 或 `/ld=sstp://user:pass@host:443` | 使用全局 MS-SSTP / SoftEther 协议落地出站 (TLS + PPP 隧道) |
+| **TURN 落地代理 (ld)** | `/?ed=2560&ld=turn://user:pass@host:3478` 或 `/ld=turn://user:pass@host:3478` | 使用全局 RFC 5766 / RFC 6062 TURN TCP relay 落地出站 |
 | **兼容老参数 proxyip** | `/?ed=2560&proxyip=...` 或 `/proxyip=...` | 向下兼容原有配置 |
 
 
