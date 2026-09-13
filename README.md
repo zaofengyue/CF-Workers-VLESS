@@ -8,7 +8,7 @@
 
 Telegram交流反馈群组: https://t.me/eooceu
 
-基于 Cloudflare Workers & Snippets 的高性能 VLESS+trojan 代理服务
+基于 Cloudflare Workers & Snippets 的高性能 VLESS+trojan+shadowsocks 代理服务
 
 YouTube视频部署教程：https://youtu.be/GEcKz2NoKlM
 
@@ -21,8 +21,9 @@ pages部署视频教程：https://www.youtube.com/watch?v=kNi6OwJ_e5k
 ## 功能特性
 
 - 🚀 基于 Cloudflare Workers 和 snippets 的高性能代理
-- 🌐 vless + trojan 双协议支持
-- 🔐 密码保护的主页访问
+- 🌐 vless + trojan + shadowsocks 三协议支持
+- ⚙️ 集成 Web 后台管理面板，绑定 KV 实现动态可视化配置（免重新部署）
+- 🔐 密码保护的主页与管理面板访问
 - 📱 支持多种客户端(v2rayN,shadowrocket,loon,karing,clash,sing-box等)
 - 🌐 自动故障转移和负载均衡
 - 📊 实时连接测试和状态监控
@@ -36,14 +37,17 @@ pages部署视频教程：https://www.youtube.com/watch?v=kNi6OwJ_e5k
 |--------|------|--------|------|
 | `PASSWORD` | 主页访问密码 | `123456` | `your_web_password` |
 
-### workers可选变量
+### workers可选变量与 KV 绑定
 
 | 变量名 | 描述 | 默认值 | 示例 |
 |--------|------|--------|------|
+| `KV`或`DATA_KV`或`CONFIG_KV` | Cloudflare KV 命名空间变量绑定 | 空 | 用于后台持久化保存全部配置 |
 | `UUID`或`AUTH`或`uuid` | 用户UUID | `5dc15e15-f285-4a9d-959b-0e4fbdd77b63` | `your-uuid` |
 | `PROXYIP`或`proxyip`或`proxyIP` | 代理服务器IP列表 | `13.230.34.30` | `tw.tp81.netlib.re` |
 | `SUB_PATH`或`subpath` | 订阅路径 | `link` | `sub` |
 | `DISABLE_TROJAN`或`CLOSE_TROJAN` | 是否关闭Trojan协议，true关闭，false开启 | `false` | 默认开启 |
+| `DISABLE_SS`或`CLOSE_SS` | 是否关闭Shadowsocks协议，true关闭，false开启 | `false` | 默认开启 |
+| `SSPATH`或`sspath` | Shadowsocks路径验证，为空则使用UUID作为验证路径 | 空 (使用UUID) | `mysecretpath` |
 
 ## 部署步骤
 
@@ -61,13 +65,23 @@ pages部署视频教程：https://www.youtube.com/watch?v=kNi6OwJ_e5k
    - 将 `_worker.js` 文件内容复制到编辑器
    - 点击 右上角 "Deploy"
 
-4. **配置环境变量**
+4. **绑定 KV 命名空间（开启后台管理持久化配置）**
+   - 在左侧菜单点击 "Workers & Pages" -> "KV"
+   - 点击 "Create namespace"，名称任意（例如 `CF_VLESS_KV`）
+   - 回到刚才创建的 Worker -> 点击 "Settings" -> "Variables and Secrets"
+   - 在 "KV Namespace Bindings" 处点击 "Add binding"
+   - Variable name（变量名称）填写：`KV`
+   - KV namespace 选择刚创建的 `CF_VLESS_KV`
+   - 点击 "Deploy" 保存
+
+5. **配置环境变量与域名**
    - 在 Worker 设置中找到 "Settings" → "Variables"
    - 添加所需的环境变量并绑定自定义域名
    - 点击 "Save"
 
-5. **访问自定义域名**
-   - 输入登录密码进入主页查看相关订阅链接
+6. **访问自定义域名使用后台**
+   - 访问你的域名，输入登录密码进入主页
+   - 切换到 **“后台管理配置”** 选项卡，可直接可视化修改 UUID、密码、订阅路径、落地 ProxyIP、优选域名列表、订阅转换后端等，保存后即时生效！
 
 ## snippets / workers 路径进阶用法
 

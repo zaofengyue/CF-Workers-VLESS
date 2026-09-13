@@ -1,22 +1,112 @@
 // 相关环境变量(都是可选的)
+// KV / DATA_KV / CONFIG_KV: 绑定 Cloudflare KV 命名空间实现后台持久化配置
 // SUB_PATH | subpath  订阅路径
 // PROXYIP  | proxyip  代理IP
 // UUID     | uuid     UUID
 // DISABLE_TROJAN | 是否关闭Trojan, 设置为true时关闭，false开启，默认开启 
+// DISABLE_SS     | 是否关闭Shadowsocks, 设置为true时关闭，false开启，默认开启
+// SSPATH   | sspath   Shadowsocks验证路径, 为空则使用UUID作为验证路径
 
 import { connect } from 'cloudflare:sockets';
 
-let subPath = 'link';     // 节点订阅路径,不修改将使用uuid作为订阅路径
-let password = '123456';  // 主页密码,建议修改或添加 PASSWORD环境变量
-let proxyIP = 'proxy.xxxxxxxx.tk:50001';  // proxyIP 格式：ip、域名、ip:port、域名:port等,没填写port，默认使用443
-let yourUUID = '5dc15e15-f285-4a9d-959b-0e4fbdd77b63'; // UUID,建议修改或添加环境便量
-let disabletro = false;  // 是否关闭trojan, 设置为true时关闭，false开启 
+const DEFAULT_CONFIG = {
+    subPath: 'link',
+    password: '123456',
+    proxyIP: 'proxy.xxxxxxxx.tk:50001',
+    yourUUID: '5dc15e15-f285-4a9d-959b-0e4fbdd77b63',
+    disabletro: false,
+    disabless: false,
+    SSpath: '',
+    cfip: [
+        'mfa.gov.ua#SG', 'saas.sin.fan#HK', 'store.ubi.com#JP','cf.130519.xyz#KR','cf.008500.xyz#HK', 
+        'cf.090227.xyz#SG', 'cf.877774.xyz#HK','cdns.doon.eu.org#JP','sub.danfeng.eu.org#TW','cf.zhetengsha.eu.org#HK'
+    ],
+    clashSubUrl: 'https://sublink.eooce.com/clash?config=',
+    singboxSubUrl: 'https://sublink.eooce.com/singbox?config='
+};
 
-// CDN 
-let cfip = [ // 格式:优选域名:端口#备注名称、优选IP:端口#备注名称、[ipv6优选]:端口#备注名称、优选域名#备注 
-    'mfa.gov.ua#SG', 'saas.sin.fan#HK', 'store.ubi.com#JP','cf.130519.xyz#KR','cf.008500.xyz#HK', 
-    'cf.090227.xyz#SG', 'cf.877774.xyz#HK','cdns.doon.eu.org#JP','sub.danfeng.eu.org#TW','cf.zhetengsha.eu.org#HK'
-];  // 在此感谢各位大佬维护的优选域名
+let subPath = DEFAULT_CONFIG.subPath;
+let password = DEFAULT_CONFIG.password;
+let proxyIP = DEFAULT_CONFIG.proxyIP;
+let yourUUID = DEFAULT_CONFIG.yourUUID;
+let disabletro = DEFAULT_CONFIG.disabletro;
+let disabless = DEFAULT_CONFIG.disabless;
+let SSpath = DEFAULT_CONFIG.SSpath;
+let cfip = [...DEFAULT_CONFIG.cfip];
+
+function getKV(env) {
+    if (!env) return null;
+    return env.KV || env.DATA_KV || env.CONFIG_KV || null;
+}
+
+async function loadConfig(env) {
+    let config = { ...DEFAULT_CONFIG, cfip: [...DEFAULT_CONFIG.cfip] };
+
+    // 1. 环境变量覆盖
+    if (env) {
+        if (env.UUID || env.uuid || env.AUTH) config.yourUUID = env.UUID || env.uuid || env.AUTH;
+        if (env.PASSWORD || env.PASSWD || env.password) config.password = env.PASSWORD || env.PASSWD || env.password;
+        if (env.SUB_PATH || env.subpath) config.subPath = env.SUB_PATH || env.subpath;
+        if (env.PROXYIP || env.proxyip || env.proxyIP) {
+            const servers = (env.PROXYIP || env.proxyip || env.proxyIP).split(',').map(s => s.trim());
+            config.proxyIP = servers[0];
+        }
+        if (env.DISABLE_TROJAN !== undefined || env.CLOSE_TROJAN !== undefined) {
+            const dt = env.DISABLE_TROJAN || env.CLOSE_TROJAN;
+            config.disabletro = dt === 'true' || dt === true;
+        }
+        if (env.DISABLE_SS !== undefined || env.CLOSE_SS !== undefined) {
+            const ds = env.DISABLE_SS || env.CLOSE_SS;
+            config.disabless = ds === 'true' || ds === true;
+        }
+        if (env.SSPATH || env.sspath) config.SSpath = env.SSPATH || env.sspath;
+        if (env.CLASH_SUB_URL) config.clashSubUrl = env.CLASH_SUB_URL;
+        if (env.SINGBOX_SUB_URL) config.singboxSubUrl = env.SINGBOX_SUB_URL;
+    }
+
+    // 2. 从 Cloudflare KV 读取持久化配置
+    const kv = getKV(env);
+    if (kv) {
+        try {
+            const kvData = await kv.get('CONFIG', 'json');
+            if (kvData && typeof kvData === 'object') {
+                if (kvData.yourUUID) config.yourUUID = String(kvData.yourUUID).trim();
+                if (kvData.password) config.password = String(kvData.password).trim();
+                if (kvData.subPath !== undefined && kvData.subPath !== null) config.subPath = String(kvData.subPath).trim();
+                if (kvData.proxyIP) config.proxyIP = String(kvData.proxyIP).trim();
+                if (Array.isArray(kvData.cfip) && kvData.cfip.length > 0) config.cfip = kvData.cfip.map(s => String(s).trim()).filter(Boolean);
+                if (kvData.disabletro !== undefined) config.disabletro = kvData.disabletro === true || kvData.disabletro === 'true';
+                if (kvData.disabless !== undefined) config.disabless = kvData.disabless === true || kvData.disabless === 'true';
+                if (kvData.SSpath !== undefined && kvData.SSpath !== null) config.SSpath = String(kvData.SSpath).trim();
+                if (kvData.clashSubUrl) config.clashSubUrl = String(kvData.clashSubUrl).trim();
+                if (kvData.singboxSubUrl) config.singboxSubUrl = String(kvData.singboxSubUrl).trim();
+            }
+        } catch (e) {
+            // KV 读取失败时使用降级配置
+        }
+    }
+
+    if (config.subPath === 'link' || config.subPath === '') {
+        config.subPath = config.yourUUID;
+    }
+    return config;
+}
+
+async function saveConfig(env, newConfig) {
+    const kv = getKV(env);
+    if (!kv) {
+        throw new Error('未检测到绑定的 KV 命名空间，请先在 Cloudflare 控制台添加名为 KV 的变量绑定');
+    }
+    await kv.put('CONFIG', JSON.stringify(newConfig));
+}
+
+async function resetConfig(env) {
+    const kv = getKV(env);
+    if (!kv) {
+        throw new Error('未检测到绑定的 KV 命名空间');
+    }
+    await kv.delete('CONFIG');
+}
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 function closeSocketQuietly(socket) { 
@@ -208,66 +298,150 @@ export default {
 	 */
     async fetch(request, env, ctx) {
         try {
+            const config = await loadConfig(env);
+            const kv = getKV(env);
+            const hasKV = !!kv;
 
-			if (subPath === 'link' || subPath === '') {
-				subPath = yourUUID;
-			}
+            yourUUID = config.yourUUID;
+            password = config.password;
+            subPath = config.subPath;
+            proxyIP = config.proxyIP;
+            disabletro = config.disabletro;
+            disabless = config.disabless;
+            SSpath = config.SSpath;
+            cfip = config.cfip;
 
-            if (env.PROXYIP || env.proxyip || env.proxyIP) {
-                const servers = (env.PROXYIP || env.proxyip || env.proxyIP).split(',').map(s => s.trim());
-                proxyIP = servers[0]; 
-            }
-            password = env.PASSWORD || env.PASSWD || env.password || password;
-            subPath = env.SUB_PATH || env.subpath || subPath;
-            yourUUID = env.UUID || env.uuid || yourUUID;
-            disabletro = env.DISABLE_TROJAN || env.CLOSE_TROJAN || disabletro;
+            const currentSSpath = config.SSpath || config.yourUUID;
+            const validSSPath = `/${currentSSpath}`;
             
             const url = new URL(request.url);
             const pathname = url.pathname;
             
+            // 1. 后台配置 API: /api/config
+            if (pathname === '/api/config') {
+                const reqPassword = url.searchParams.get('password') || request.headers.get('x-password');
+                if (reqPassword !== config.password) {
+                    return new Response(JSON.stringify({ success: false, message: '身份鉴权失败，密码错误' }), {
+                        status: 401,
+                        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                    });
+                }
+                if (request.method === 'POST') {
+                    if (!hasKV) {
+                        return new Response(JSON.stringify({ 
+                            success: false, 
+                            message: '未检测到绑定的 KV 命名空间！请先在 Cloudflare 控制台为该 Worker 添加名为 KV 的变量绑定。' 
+                        }), {
+                            status: 400,
+                            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                        });
+                    }
+                    try {
+                        const body = await request.json();
+                        let newCfip = config.cfip;
+                        if (typeof body.cfip === 'string') {
+                            newCfip = body.cfip.split('\n').map(s => s.trim()).filter(Boolean);
+                        } else if (Array.isArray(body.cfip)) {
+                            newCfip = body.cfip.map(s => String(s).trim()).filter(Boolean);
+                        }
+                        
+                        const updatedConfig = {
+                            yourUUID: (body.yourUUID && String(body.yourUUID).trim()) || config.yourUUID,
+                            password: (body.password && String(body.password).trim()) || config.password,
+                            subPath: body.subPath !== undefined ? String(body.subPath).trim() : config.subPath,
+                            proxyIP: (body.proxyIP && String(body.proxyIP).trim()) || config.proxyIP,
+                            disabletro: body.disabletro === true || body.disabletro === 'true',
+                            disabless: body.disabless === true || body.disabless === 'true',
+                            SSpath: body.SSpath !== undefined ? String(body.SSpath).trim() : config.SSpath,
+                            cfip: newCfip.length > 0 ? newCfip : config.cfip,
+                            clashSubUrl: (body.clashSubUrl && String(body.clashSubUrl).trim()) || config.clashSubUrl,
+                            singboxSubUrl: (body.singboxSubUrl && String(body.singboxSubUrl).trim()) || config.singboxSubUrl
+                        };
+                        await saveConfig(env, updatedConfig);
+                        return new Response(JSON.stringify({ success: true, message: '配置已成功持久化保存到 Cloudflare KV！' }), {
+                            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                        });
+                    } catch (err) {
+                        return new Response(JSON.stringify({ success: false, message: '保存失败: ' + err.message }), {
+                            status: 500,
+                            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                        });
+                    }
+                } else if (request.method === 'GET') {
+                    return new Response(JSON.stringify({ success: true, config, hasKV }), {
+                        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                    });
+                }
+            }
+
+            // 2. 后台重置 API: /api/reset
+            if (pathname === '/api/reset' && request.method === 'POST') {
+                const reqPassword = url.searchParams.get('password') || request.headers.get('x-password');
+                if (reqPassword !== config.password) {
+                    return new Response(JSON.stringify({ success: false, message: '身份鉴权失败，密码错误' }), {
+                        status: 401,
+                        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                    });
+                }
+                if (!hasKV) {
+                    return new Response(JSON.stringify({ success: false, message: '未绑定 KV 存储，无法重置' }), {
+                        status: 400,
+                        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                    });
+                }
+                await resetConfig(env);
+                return new Response(JSON.stringify({ success: true, message: '已清除 KV 配置，恢复默认设置！' }), {
+                    headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                });
+            }
+
+            // 3. 路径中 proxyip 处理
             let pathProxyIP = null;
-            if (pathname.startsWith('/proxyip=')) {
+            const proxyIpMatch = pathname.match(/\/proxyip=([^/?&#]+)/i);
+            if (proxyIpMatch) {
+                try {
+                    pathProxyIP = decodeURIComponent(proxyIpMatch[1]).trim();
+                } catch (e) {
+                    // 忽略错误
+                }
+            } else if (pathname.startsWith('/proxyip=')) {
                 try {
                     pathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
                 } catch (e) {
                     // 忽略错误
                 }
-
-                if (pathProxyIP && !request.headers.get('Upgrade')) {
-                    proxyIP = pathProxyIP;
-                    return new Response(`set proxyIP to: ${proxyIP}\n\n`, {
-                        headers: { 
-                            'Content-Type': 'text/plain; charset=utf-8',
-                            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-                        },
-                    });
-                }
             }
 
+            if (pathProxyIP && !request.headers.get('Upgrade')) {
+                config.proxyIP = pathProxyIP;
+                proxyIP = pathProxyIP;
+                return new Response(`set proxyIP to: ${proxyIP}\n\n`, {
+                    headers: { 
+                        'Content-Type': 'text/plain; charset=utf-8',
+                        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                    },
+                });
+            }
+
+            // 4. WebSocket 连接
             if (request.headers.get('Upgrade') === 'websocket') {
-                let wsPathProxyIP = null;
-                if (pathname.startsWith('/proxyip=')) {
-                    try {
-                        wsPathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
-                    } catch (e) {
-                        // 忽略错误
-                    }
-                }
-                
-                const customProxyIP = wsPathProxyIP || url.searchParams.get('proxyip') || request.headers.get('proxyip');
-                return await handleVlsRequest(request, customProxyIP);
+                const customProxyIP = pathProxyIP || url.searchParams.get('proxyip') || request.headers.get('proxyip');
+                return await handleVlsRequest(request, customProxyIP, validSSPath);
             } else if (request.method === 'GET') {
+                // 5. Web 首页与管理面板
                 if (url.pathname === '/') {
-                    return getHomePage(request);
+                    return getHomePage(request, validSSPath, config, hasKV);
                 }
                 
-                if (url.pathname.toLowerCase().includes(`/${subPath.toLowerCase()}`)) {
+                // 6. 订阅输出
+                if (url.pathname.toLowerCase().includes(`/${config.subPath.toLowerCase()}`)) {
                     const currentDomain = url.hostname;
                     const vlsHeader = 'v' + 'l' + 'e' + 's' + 's';
                     const troHeader = 't' + 'r' + 'o' + 'j' + 'a' + 'n';
+                    const ssHeader = 's' + 's';
                     
-                    // 生成 VLE-SS 节点
-                    const vlsLinks = cfip.map(cdnItem => {
+                    // 生成 VLESS 节点
+                    const vlsLinks = config.cfip.map(cdnItem => {
                         let host, port = 443, nodeName = '';
                         if (cdnItem.includes('#')) {
                             const parts = cdnItem.split('#');
@@ -289,13 +463,13 @@ export default {
                         }
                         
                         const vlsNodeName = nodeName ? `${nodeName}-${vlsHeader}` : `Workers-${vlsHeader}`;
-                        return `${vlsHeader}://${yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${vlsNodeName}`;
+                        return `${vlsHeader}://${config.yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${vlsNodeName}`;
                     });
                     
-                    // 生成 Tro-jan 节点
-                    let allLinks = [...vlsLinks];
-                    if (!disabletro) {
-                        const troLinks = cfip.map(cdnItem => {
+                    // 生成 Trojan 节点
+                    let troLinks = [];
+                    if (!config.disabletro) {
+                        troLinks = config.cfip.map(cdnItem => {
                             let host, port = 443, nodeName = '';
                             if (cdnItem.includes('#')) {
                                 const parts = cdnItem.split('#');
@@ -317,10 +491,52 @@ export default {
                             }
                             
                             const troNodeName = nodeName ? `${nodeName}-${troHeader}` : `Workers-${troHeader}`;
-                            return `${troHeader}://${yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${troNodeName}`;
+                            return `${troHeader}://${config.yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${troNodeName}`;
                         });
-                        allLinks = [...vlsLinks, ...troLinks];
                     }
+
+                    // 生成 Shadowsocks 节点
+                    let ssLinks = [];
+                    if (!config.disabless) {
+                        const method = 'none';
+                        const ssConfig = `${method}:${config.yourUUID}`;
+                        const encodedConfig = btoa(ssConfig);
+                        ssLinks = config.cfip.map(cdnItem => {
+                            let host, port = 443, nodeName = '';
+                            if (cdnItem.includes('#')) {
+                                const parts = cdnItem.split('#');
+                                cdnItem = parts[0];
+                                nodeName = parts[1];
+                            }
+
+                            if (cdnItem.startsWith('[') && cdnItem.includes(']:')) {
+                                const ipv6End = cdnItem.indexOf(']:');
+                                host = cdnItem.substring(0, ipv6End + 1); 
+                                const portStr = cdnItem.substring(ipv6End + 2); 
+                                port = parseInt(portStr) || 443;
+                            } else if (cdnItem.includes(':')) {
+                                const parts = cdnItem.split(':');
+                                host = parts[0];
+                                port = parseInt(parts[1]) || 443;
+                            } else {
+                                host = cdnItem;
+                            }
+                            
+                            const ssNodeName = nodeName ? `${nodeName}-${ssHeader}` : `Workers-${ssHeader}`;
+                            return `${ssHeader}://${encodedConfig}@${host}:${port}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${validSSPath}/?ed%3D2560;tls;sni%3D${currentDomain};skip-cert-verify%3Dtrue;mux%3D0#${ssNodeName}`;
+                        });
+                    }
+
+                    let allLinks = [...vlsLinks, ...troLinks, ...ssLinks];
+                    const filterType = url.searchParams.get('type') ? url.searchParams.get('type').toLowerCase() : '';
+                    if (filterType === 'ss' || filterType === 'shadowsocks') {
+                        allLinks = ssLinks;
+                    } else if (filterType === 'vless') {
+                        allLinks = vlsLinks;
+                    } else if (filterType === 'trojan') {
+                        allLinks = troLinks;
+                    }
+
                     const linksText = allLinks.join('\n');
                     const base64Content = btoa(unescape(encodeURIComponent(linksText)));
                     return new Response(base64Content, {
@@ -333,7 +549,7 @@ export default {
             }
             return new Response('Not Found', { status: 404 });
         } catch (err) {
-            return new Response('Internal Server Error', { status: 500 });
+            return new Response('Internal Server Error: ' + err.message, { status: 500 });
         }
     },
 };
@@ -341,8 +557,10 @@ export default {
 /**
  * 
  * @param {import("@cloudflare/workers-types").Request} request
+ * @param {string} customProxyIP
+ * @param {string} validSSPath
  */
-async function handleVlsRequest(request, customProxyIP) {
+async function handleVlsRequest(request, customProxyIP, validSSPath) {
     const wssPair = new WebSocketPair();
     const clientSock = wssPair[0];
     const serverSock = wssPair[1];
@@ -354,6 +572,10 @@ async function handleVlsRequest(request, customProxyIP) {
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
 
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+    const isSSPath = validSSPath && pathname.toLowerCase().startsWith(validSSPath.toLowerCase());
+
     readable.pipeTo(new WritableStream({
         async write(chunk) {
             if (isDnsQuery) return await forwardataudp(chunk, serverSock, null);
@@ -364,6 +586,7 @@ async function handleVlsRequest(request, customProxyIP) {
                 return;
             }
             
+            // 1. 尝试 Trojan 协议解析
             if (!disabletro) {
                 const trojanResult = await parsetroHeader(chunk, yourUUID);
                 if (!trojanResult.hasError) {
@@ -379,21 +602,48 @@ async function handleVlsRequest(request, customProxyIP) {
                 }
             }
             
-            const { hasError, message, addressType, port, hostname, rawIndex, version, isUDP } = parseVLsPacketHeader(chunk, yourUUID);
-            if (hasError) throw new Error(message);
+            // 2. 尝试 VLESS 协议解析
+            const vlsResult = parseVLsPacketHeader(chunk, yourUUID);
+            if (!vlsResult.hasError) {
+                const { addressType, port, hostname, rawIndex, version, isUDP } = vlsResult;
 
-            if (isSpeedTestSite(hostname)) {
-                throw new Error('Speedtest site is blocked');
+                if (isSpeedTestSite(hostname)) {
+                    throw new Error('Speedtest site is blocked');
+                }
+
+                if (isUDP) {
+                    if (port === 53) isDnsQuery = true;
+                    else throw new Error('UDP is not supported');
+                }
+                const respHeader = new Uint8Array([version[0], 0]);
+                const rawData = chunk.slice(rawIndex);
+                if (isDnsQuery) return forwardataudp(rawData, serverSock, respHeader);
+                await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, customProxyIP);
+                return;
             }
 
-            if (isUDP) {
-                if (port === 53) isDnsQuery = true;
-                else throw new Error('UDP is not supported');
+            // 3. 尝试 Shadowsocks 协议解析
+            if (!disabless && isSSPath) {
+                const ssResult = parseSSPacketHeader(chunk);
+                if (!ssResult.hasError) {
+                    const { addressType, port, hostname, rawIndex } = ssResult;
+
+                    if (isSpeedTestSite(hostname)) {
+                        throw new Error('Speedtest site is blocked');
+                    }
+
+                    if (addressType === 2) { 
+                        if (port === 53) isDnsQuery = true;
+                        else throw new Error('UDP is not supported');
+                    }
+                    const rawData = chunk.slice(rawIndex);
+                    if (isDnsQuery) return forwardataudp(rawData, serverSock, null);
+                    await forwardataTCP(hostname, port, rawData, serverSock, null, remoteConnWrapper, customProxyIP);
+                    return;
+                }
             }
-            const respHeader = new Uint8Array([version[0], 0]);
-            const rawData = chunk.slice(rawIndex);
-            if (isDnsQuery) return forwardataudp(rawData, serverSock, respHeader);
-            await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, customProxyIP);
+
+            throw new Error(vlsResult.message || 'Protocol parse error');
         },
     })).catch((err) => {
         // console.error('Readable pipe error:', err);
@@ -711,6 +961,43 @@ function parseVLsPacketHeader(chunk, token) {
     return { hasError: false, addressType, port, hostname, isUDP, rawIndex: addrValIdx + addrLen, version };
 }
 
+function parseSSPacketHeader(chunk) {
+    if (chunk.byteLength < 7) return { hasError: true, message: 'Invalid data' };
+    try {
+        const view = new Uint8Array(chunk);
+        const addressType = view[0];
+        let addrIdx = 1, addrLen = 0, addrValIdx = addrIdx, hostname = '';
+        switch (addressType) {
+            case 1: // IPv4
+                addrLen = 4; 
+                hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.'); 
+                addrValIdx += addrLen;
+                break;
+            case 3: // Domain
+                addrLen = view[addrIdx];
+                addrValIdx += 1; 
+                hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
+                addrValIdx += addrLen;
+                break;
+            case 4: // IPv6
+                addrLen = 16; 
+                const ipv6 = []; 
+                const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
+                for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16)); 
+                hostname = ipv6.join(':'); 
+                addrValIdx += addrLen;
+                break;
+            default: 
+                return { hasError: true, message: `Invalid address type: ${addressType}` };
+        }
+        if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
+        const port = new DataView(chunk.slice(addrValIdx, addrValIdx + 2)).getUint16(0);
+        return { hasError: false, addressType, port, hostname, rawIndex: addrValIdx + 2 };
+    } catch (e) {
+        return { hasError: true, message: 'Failed to parse SS packet header' };
+    }
+}
+
 function makeReadableStr(socket, earlyDataHeader) {
     let cancelled = false;
     return new ReadableStream({
@@ -804,16 +1091,19 @@ async function forwardataudp(udpChunk, webSocket, respHeader) {
 
 /**
  * @param {import("@cloudflare/workers-types").Request} request
+ * @param {string} validSSPath
+ * @param {object} config
+ * @param {boolean} hasKV
  * @returns {Response}
  */
-function getHomePage(request) {
+function getHomePage(request, validSSPath, config, hasKV) {
 	const url = request.headers.get('Host');
 	const baseUrl = `https://${url}`;
 	const urlObj = new URL(request.url);
 	const providedPassword = urlObj.searchParams.get('password');
 	if (providedPassword) {
-		if (providedPassword === password) {
-			return getMainPageContent(url, baseUrl);
+		if (providedPassword === config.password) {
+			return getMainPageContent(url, baseUrl, validSSPath, config, hasKV);
 		} else {
 			return getLoginPage(url, baseUrl, true);
 		}
@@ -1016,15 +1306,22 @@ function getLoginPage(url, baseUrl, showError = false) {
  * 获取主页内容(密码验证通过后显示)
  * @param {string} url 
  * @param {string} baseUrl 
+ * @param {string} validSSPath
+ * @param {object} config
+ * @param {boolean} hasKV
  * @returns {Response}
  */
-function getMainPageContent(url, baseUrl) {
+function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
+    const clashFullUrl = `${config.clashSubUrl || 'https://sublink.eooce.com/clash?config='}${baseUrl}/${config.subPath}`;
+    const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.eooce.com/singbox?config='}${baseUrl}/${config.subPath}`;
+    const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=none,password=${config.yourUUID},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
+
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Workers Service</title>
+    <title>Workers Service - 管理面板</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         * {
@@ -1036,23 +1333,22 @@ function getMainPageContent(url, baseUrl) {
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #66ead7 0%, #9461c8 100%);
-            height: 100vh;
+            min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
             color: #333;
             margin: 0;
-            padding: 0;
-            overflow: hidden;
+            padding: 15px 0;
         }
         
         .container {
-            background: rgba(255, 255, 255, 0.95);
+            background: rgba(255, 255, 255, 0.96);
             backdrop-filter: blur(10px);
             border-radius: 20px;
-            padding: 20px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
-            max-width: 800px;
+            padding: 24px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.12);
+            max-width: 820px;
             width: 95%;
             max-height: 90vh;
             text-align: center;
@@ -1067,7 +1363,7 @@ function getMainPageContent(url, baseUrl) {
             top: 20px;
             right: 20px;
             background: #a7a0d8;
-            color: #dc2929;
+            color: #b91c1c;
             border: none;
             border-radius: 8px;
             padding: 8px 16px;
@@ -1082,12 +1378,8 @@ function getMainPageContent(url, baseUrl) {
             z-index: 1000;
         }
         
-        .logout-btn i {
-            font-size: 0.9rem;
-        }
-        
         .logout-btn:hover {
-            background: #e0e0e0;
+            background: #e2e8f0;
             transform: translateY(-1px);
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
         }
@@ -1102,31 +1394,82 @@ function getMainPageContent(url, baseUrl) {
         
         .title {
             font-size: 1.8rem;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             color: #2d3748;
         }
         
         .subtitle {
             color: #718096;
-            margin-bottom: 15px;
-            font-size: 1rem;
+            margin-bottom: 16px;
+            font-size: 0.95rem;
+        }
+
+        /* 标签页切换导航 */
+        .nav-tabs {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            margin-bottom: 16px;
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 10px;
+        }
+
+        .nav-tab {
+            background: #f1f5f9;
+            border: 1px solid #cbd5e1;
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #64748b;
+            padding: 9px 20px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .nav-tab:hover {
+            background: #e2e8f0;
+            color: #334155;
+        }
+
+        .nav-tab.active {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            border-color: transparent;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+        }
+
+        .tab-content {
+            display: none;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
         }
         
+        /* 节点展示卡片 */
         .info-card {
-            background: #f7fafc;
+            background: #f8fafc;
             border-radius: 12px;
-            padding: 15px;
+            padding: 16px;
             margin: 10px 0;
-            border-left: 3px solid #6ed8c9;
-            flex: 1;
-            overflow-y: auto;
+            border-left: 4px solid #6ed8c9;
+            text-align: left;
         }
         
         .info-item {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 6px 0;
+            padding: 8px 0;
             border-bottom: 1px solid #e2e8f0;
             font-size: 0.9rem;
         }
@@ -1138,15 +1481,19 @@ function getMainPageContent(url, baseUrl) {
         .label {
             font-weight: 600;
             color: #4a5568;
+            flex-shrink: 0;
         }
         
         .value {
-            color:rgb(20, 23, 29);
+            color: rgb(20, 23, 29);
             font-family: 'Courier New', monospace;
             background: #edf2f7;
-            padding: 4px 8px;
+            padding: 4px 10px;
             border-radius: 6px;
-            font-size: 0.8rem;
+            font-size: 0.82rem;
+            word-break: break-all;
+            margin-left: 12px;
+            text-align: right;
         }
         
         .button-group {
@@ -1154,7 +1501,7 @@ function getMainPageContent(url, baseUrl) {
             gap: 10px;
             justify-content: center;
             flex-wrap: wrap;
-            margin: 15px 0;
+            margin: 16px 0;
         }
         
         .btn {
@@ -1165,13 +1512,15 @@ function getMainPageContent(url, baseUrl) {
             font-weight: 600;
             cursor: pointer;
             text-decoration: none;
-            display: inline-block;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
             transition: all 0.3s ease;
-            min-width: 100px;
         }
         
         .btn-primary {
-            background: linear-gradient(45deg, #667eea, #764ba2);
+            background: linear-gradient(45deg, #4f46e5, #7c3aed);
             color: white;
         }
         
@@ -1179,10 +1528,15 @@ function getMainPageContent(url, baseUrl) {
             background: linear-gradient(45deg, #68e3d6, #906cc9);
             color: #001379;
         }
+
+        .btn-danger {
+            background: linear-gradient(45deg, #ef4444, #dc2626);
+            color: white;
+        }
         
         .btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.15);
         }
         
         .status {
@@ -1191,7 +1545,7 @@ function getMainPageContent(url, baseUrl) {
             height: 10px;
             border-radius: 50%;
             background: #48bb78;
-            margin-right: 8px;
+            margin-right: 6px;
             animation: pulse 2s infinite;
         }
         
@@ -1200,11 +1554,183 @@ function getMainPageContent(url, baseUrl) {
             50% { opacity: 0.5; }
             100% { opacity: 1; }
         }
+
+        /* 后台设置面板样式 */
+        .badge-kv {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 12px 16px;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            margin-bottom: 18px;
+            text-align: left;
+            line-height: 1.5;
+        }
+
+        .badge-kv.connected {
+            background: #ecfdf5;
+            color: #065f46;
+            border: 1px solid #6ee7b7;
+        }
+
+        .badge-kv.disconnected {
+            background: #fffbeb;
+            color: #92400e;
+            border: 1px solid #fcd34d;
+        }
+
+        .badge-kv i {
+            font-size: 1.1rem;
+            margin-top: 2px;
+        }
+
+        .config-card {
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 18px;
+            margin-bottom: 16px;
+            text-align: left;
+            border: 1px solid #e2e8f0;
+        }
+
+        .config-card h3 {
+            font-size: 1.05rem;
+            color: #1e293b;
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px dashed #cbd5e1;
+            padding-bottom: 8px;
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 14px;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            margin-bottom: 12px;
+        }
+
+        .form-group label {
+            font-weight: 600;
+            font-size: 0.85rem;
+            color: #334155;
+            margin-bottom: 6px;
+        }
+
+        .form-input, .form-textarea {
+            width: 100%;
+            padding: 9px 12px;
+            border: 1.5px solid #cbd5e1;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            background: white;
+            color: #1e293b;
+            transition: all 0.2s ease;
+        }
+
+        .form-input:focus, .form-textarea:focus {
+            outline: none;
+            border-color: #6366f1;
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+        }
+
+        .form-textarea {
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            resize: vertical;
+        }
+
+        .form-hint {
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-top: 4px;
+        }
+
+        .switch-group {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        .switch-group:last-child {
+            border-bottom: none;
+        }
+
+        .switch-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .switch-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #1e293b;
+        }
+
+        .switch-desc {
+            font-size: 0.75rem;
+            color: #64748b;
+        }
+
+        /* 开关切换滑块 */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 46px;
+            height: 24px;
+            flex-shrink: 0;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #cbd5e1;
+            transition: .3s;
+            border-radius: 24px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .3s;
+            border-radius: 50%;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+
+        input:checked + .slider {
+            background-color: #10b981;
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(22px);
+        }
         
         .footer {
-            margin-top: 10px;
+            margin-top: 15px;
             color: #718096;
-            font-size: 1rem;
+            font-size: 0.9rem;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -1246,19 +1772,19 @@ function getMainPageContent(url, baseUrl) {
             position: fixed;
             top: 20px;
             right: 20px;
-            background:rgb(244, 252, 247);
-            border-left: 4px solid #48bb78;
+            background: #ffffff;
+            border-left: 4px solid #10b981;
             border-radius: 8px;
-            padding: 12px 16px;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            padding: 12px 18px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
             display: flex;
             align-items: center;
             gap: 10px;
-            z-index: 1000;
+            z-index: 1100;
             opacity: 0;
             transform: translateX(100%);
             transition: all 0.3s ease;
-            max-width: 300px;
+            max-width: 320px;
         }
         
         .toast.show {
@@ -1267,9 +1793,9 @@ function getMainPageContent(url, baseUrl) {
         }
         
         .toast-icon {
-            width: 20px;
-            height: 20px;
-            background: #48bb78;
+            width: 22px;
+            height: 22px;
+            background: #10b981;
             border-radius: 50%;
             display: flex;
             align-items: center;
@@ -1277,47 +1803,21 @@ function getMainPageContent(url, baseUrl) {
             color: white;
             font-size: 12px;
             font-weight: bold;
+            flex-shrink: 0;
         }
         
         .toast-message {
-            color: #2d3748;
+            color: #1e293b;
             font-size: 14px;
             font-weight: 500;
+            text-align: left;
         }
         
         @media (max-width: 768px) {
             .container {
-                padding: 15px;
-                margin: 10px;
-                max-height: 95vh;
-            }
-            
-            .logout-btn {
-                top: 15px;
-                right: 15px;
-                padding: 6px 12px;
-                font-size: 0.8rem;
-            }
-            
-            .logo {
-                font-size: 2rem;
-            }
-            
-            .title {
-                font-size: 1.5rem;
-            }
-            
-            .button-group {
-                flex-direction: column;
-                align-items: center;
-                gap: 8px;
-            }
-            
-            .btn {
-                width: 100%;
-                max-width: 180px;
-                padding: 8px 16px;
-                font-size: 0.85rem;
+                padding: 16px;
+                margin: 8px;
+                max-height: 94vh;
             }
             
             .info-item {
@@ -1327,36 +1827,18 @@ function getMainPageContent(url, baseUrl) {
             }
             
             .value {
-                word-break: break-all;
-                font-size: 0.8rem;
+                margin-left: 0;
+                text-align: left;
+                width: 100%;
             }
             
-            .footer-links {
-                flex-direction: column;
-                gap: 10px;
+            .form-grid {
+                grid-template-columns: 1fr;
             }
-        }
-        
-        @media (max-width: 480px) {
-            .container {
-                padding: 10px;
-                margin: 5px;
-            }
-            
-            .info-card {
-                padding: 10px;
-            }
-            
-            .toast {
-                top: 10px;
-                right: 10px;
-                left: 10px;
-                max-width: none;
-                transform: translateY(-100%);
-            }
-            
-            .toast.show {
-                transform: translateY(0);
+
+            .nav-tab {
+                padding: 8px 14px;
+                font-size: 0.85rem;
             }
         }
     </style>
@@ -1370,39 +1852,191 @@ function getMainPageContent(url, baseUrl) {
     <div class="container">
         <div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo"></div>
         <h1 class="title">Workers Service</h1>
-        <p class="subtitle">基于 Cloudflare Workers 的高性能网络服务 (VLESS + Trojan)</p>
-        
-        <div class="info-card">
-            <div class="info-item">
-                <span class="label">服务状态</span>
-                <span class="value"><span class="status"></span>运行中</span>
-            </div>
-            <div class="info-item">
-                <span class="label">主机地址</span>
-                <span class="value">${url}</span>
-            </div>
-            <div class="info-item">
-                <span class="label">UUID</span>
-                <span class="value">${yourUUID}</span>
-            </div>
-            <div class="info-item">
-                <span class="label">V2rayN订阅地址</span>
-                <span class="value">${baseUrl}/${subPath}</span>
-            </div>
-            <div class="info-item">
-                <span class="label">Clash订阅地址</span>
-                <span class="value">https://sublink.eooce.com/clash?config=${baseUrl}/${subPath}</span>
-            </div>
-            <div class="info-item">
-                <span class="label">singbox订阅地址</span>
-                <span class="value">https://sublink.eooce.com/singbox?config=${baseUrl}/${subPath}</span>
-            </div>
+        <p class="subtitle">基于 Cloudflare Workers 的高性能网络服务 (VLESS + Trojan + Shadowsocks)</p>
+
+        <!-- 标签页导航 -->
+        <div class="nav-tabs">
+            <button type="button" class="nav-tab active" id="tab-btn-nodes" onclick="switchTab('nodes')">
+                <i class="fas fa-network-wired"></i> 节点与订阅
+            </button>
+            <button type="button" class="nav-tab" id="tab-btn-admin" onclick="switchTab('admin')">
+                <i class="fas fa-sliders-h"></i> 后台管理配置
+            </button>
         </div>
         
-        <div class="button-group">
-            <button onclick="copySingboxSubscription()" class="btn btn-secondary">复制singbox订阅链接</button>
-            <button onclick="copyClashSubscription()" class="btn btn-secondary">复制Clash订阅链接</button>
-            <button onclick="copySubscription()" class="btn btn-secondary">复制V2rayN订阅链接</button>
+        <!-- Tab 1: 节点与订阅 -->
+        <div id="tab-nodes" class="tab-content active">
+            <div class="info-card">
+                <div class="info-item">
+                    <span class="label">服务状态</span>
+                    <span class="value"><span class="status"></span>运行中</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">KV 存储状态</span>
+                    <span class="value">${hasKV ? '<span style="color:#059669;font-weight:bold;">已连接 (配置持久化)</span>' : '<span style="color:#d97706;font-weight:bold;">未绑定 (环境变量/默认)</span>'}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">主机地址</span>
+                    <span class="value">${url}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">UUID</span>
+                    <span class="value">${config.yourUUID}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">SS 节点路径</span>
+                    <span class="value">${validSSPath}/?ed=2560</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">全协议订阅地址</span>
+                    <span class="value">${baseUrl}/${config.subPath}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Clash 订阅地址</span>
+                    <span class="value">${clashFullUrl}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Sing-box 订阅地址</span>
+                    <span class="value">${singboxFullUrl}</span>
+                </div>
+            </div>
+            
+            <div class="button-group">
+                <button onclick="copySingboxSubscription()" class="btn btn-secondary">
+                    <i class="fas fa-cube"></i> 复制 Sing-box 订阅
+                </button>
+                <button onclick="copyClashSubscription()" class="btn btn-secondary">
+                    <i class="fas fa-cat"></i> 复制 Clash 订阅
+                </button>
+                <button onclick="copySubscription()" class="btn btn-secondary">
+                    <i class="fas fa-link"></i> 复制全部节点订阅
+                </button>
+                <button onclick="copyQXConfig()" class="btn btn-secondary">
+                    <i class="fas fa-paper-plane"></i> 复制 Quantumult X 配置
+                </button>
+            </div>
+        </div>
+
+        <!-- Tab 2: 后台管理配置 -->
+        <div id="tab-admin" class="tab-content">
+            ${hasKV ? `
+            <div class="badge-kv connected">
+                <i class="fas fa-check-circle"></i>
+                <div>
+                    <b>Cloudflare KV 命名空间已成功连接！</b><br>
+                    在此面板修改并保存后，配置将自动持久化保存在 KV 中，所有节点与订阅即时生效，无需重新部署 Worker。
+                </div>
+            </div>
+            ` : `
+            <div class="badge-kv disconnected">
+                <i class="fas fa-exclamation-triangle"></i>
+                <div>
+                    <b>未检测到名为 KV 的命名空间绑定！</b> 当前显示的为环境变量或代码默认值。<br>
+                    <b>如需在后台持久化保存配置：</b><br>
+                    1. 访问 Cloudflare Dashboard &rarr; <b>Workers & Pages</b> &rarr; <b>KV</b> 创建一个命名空间（如 <code>CF_VLESS_KV</code>）；<br>
+                    2. 进入该 Worker 的 <b>Settings</b> &rarr; <b>Variables and Secrets</b> &rarr; <b>KV Namespace Bindings</b>；<br>
+                    3. 添加变量名称为 <b><code>KV</code></b> 的绑定，目标选择刚创建的命名空间，点击 Deploy 即可。
+                </div>
+            </div>
+            `}
+
+            <!-- 基础设置 -->
+            <div class="config-card">
+                <h3><i class="fas fa-key"></i> 基础认证与订阅路径</h3>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="cfg-uuid">用户 UUID</label>
+                        <input type="text" id="cfg-uuid" class="form-input" value="${config.yourUUID}" placeholder="例如: 5dc15e15-f285-4a9d-959b-0e4fbdd77b63">
+                        <span class="form-hint">客户端连接节点使用的 UUID 密钥</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-password">后台管理密码</label>
+                        <input type="text" id="cfg-password" class="form-input" value="${config.password}" placeholder="网页访问管理密码">
+                        <span class="form-hint">登录管理面板所用的密码</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-subpath">节点订阅路径 (SUB_PATH)</label>
+                        <input type="text" id="cfg-subpath" class="form-input" value="${config.subPath}" placeholder="如 link 或自定义字符串">
+                        <span class="form-hint">访问 /路径 获取节点，留空将默认使用 UUID</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-sspath">Shadowsocks 验证路径 (SSPATH)</label>
+                        <input type="text" id="cfg-sspath" class="form-input" value="${config.SSpath}" placeholder="留空则默认使用 UUID">
+                        <span class="form-hint">SS 节点 WebSocket 路径鉴权，留空使用 UUID</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 协议开关 -->
+            <div class="config-card">
+                <h3><i class="fas fa-toggle-on"></i> 协议启用开关</h3>
+                <div class="switch-group">
+                    <div class="switch-info">
+                        <span class="switch-title">Trojan 协议</span>
+                        <span class="switch-desc">是否开启 Trojan 协议节点支持</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="cfg-trojan" ${config.disabletro ? '' : 'checked'}>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="switch-group">
+                    <div class="switch-info">
+                        <span class="switch-title">Shadowsocks 协议</span>
+                        <span class="switch-desc">是否开启 Shadowsocks (v2ray-plugin WS) 节点支持</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="cfg-ss" ${config.disabless ? '' : 'checked'}>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- ProxyIP 落地出站设置 -->
+            <div class="config-card">
+                <h3><i class="fas fa-server"></i> 落地代理 ProxyIP 出站设置</h3>
+                <div class="form-group">
+                    <label for="cfg-proxyip">ProxyIP 服务器地址</label>
+                    <input type="text" id="cfg-proxyip" class="form-input" value="${config.proxyIP}" placeholder="例如: proxy.xxxxxxxx.tk:50001">
+                    <span class="form-hint">支持：<code>IP:端口</code>、<code>域名:端口</code>、<code>socks5://user:pass@host:port</code> 或 <code>http://user:pass@host:port</code></span>
+                </div>
+            </div>
+
+            <!-- 优选节点列表 -->
+            <div class="config-card">
+                <h3><i class="fas fa-bolt"></i> 优选 CDN 域名与 IP 列表 (每行一个)</h3>
+                <div class="form-group">
+                    <textarea id="cfg-cfip" class="form-textarea" rows="7" placeholder="格式支持:&#10;域名:端口#名称&#10;IP:端口#名称&#10;[IPv6]:端口#名称&#10;域名#名称">${config.cfip.join('\n')}</textarea>
+                    <span class="form-hint">格式：<code>优选域名:端口#节点名称</code> 或 <code>优选IP:端口#节点名称</code>，将自动生成在订阅中</span>
+                </div>
+            </div>
+
+            <!-- 订阅转换后端设置 -->
+            <div class="config-card">
+                <h3><i class="fas fa-sync-alt"></i> 订阅转换服务后端地址</h3>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="cfg-clash-sub">Clash 订阅转换前缀</label>
+                        <input type="text" id="cfg-clash-sub" class="form-input" value="${config.clashSubUrl}">
+                        <span class="form-hint">默认: https://sublink.eooce.com/clash?config=</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-singbox-sub">Sing-box 订阅转换前缀</label>
+                        <input type="text" id="cfg-singbox-sub" class="form-input" value="${config.singboxSubUrl}">
+                        <span class="form-hint">默认: https://sublink.eooce.com/singbox?config=</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 操作按钮 -->
+            <div class="button-group">
+                <button type="button" onclick="saveAdminConfig()" class="btn btn-primary" style="padding: 12px 28px; font-size: 1rem;">
+                    <i class="fas fa-save"></i> 保存并立即生效
+                </button>
+                <button type="button" onclick="resetAdminConfig()" class="btn btn-danger" style="padding: 12px 20px;">
+                    <i class="fas fa-undo"></i> 恢复默认配置
+                </button>
+            </div>
         </div>
         
         <div class="footer">
@@ -1426,6 +2060,20 @@ function getMainPageContent(url, baseUrl) {
     </div>
     
     <script>
+        let currentPassword = '${config.password}';
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            if (tabName === 'nodes') {
+                document.getElementById('tab-btn-nodes').classList.add('active');
+                document.getElementById('tab-nodes').classList.add('active');
+            } else {
+                document.getElementById('tab-btn-admin').classList.add('active');
+                document.getElementById('tab-admin').classList.add('active');
+            }
+        }
+
         function showToast(message) {
             const existingToast = document.querySelector('.toast');
             if (existingToast) {
@@ -1459,13 +2107,75 @@ function getMainPageContent(url, baseUrl) {
                         toast.parentNode.removeChild(toast);
                     }
                 }, 300);
-            }, 1500);
+            }, 1800);
+        }
+
+        async function saveAdminConfig() {
+            const cfipRaw = document.getElementById('cfg-cfip').value;
+            const cfipList = cfipRaw.split('\\n').map(s => s.trim()).filter(Boolean);
+            const newPwd = document.getElementById('cfg-password').value.trim();
+            
+            const payload = {
+                yourUUID: document.getElementById('cfg-uuid').value.trim(),
+                password: newPwd,
+                subPath: document.getElementById('cfg-subpath').value.trim(),
+                SSpath: document.getElementById('cfg-sspath').value.trim(),
+                disabletro: !document.getElementById('cfg-trojan').checked,
+                disabless: !document.getElementById('cfg-ss').checked,
+                proxyIP: document.getElementById('cfg-proxyip').value.trim(),
+                cfip: cfipList,
+                clashSubUrl: document.getElementById('cfg-clash-sub').value.trim(),
+                singboxSubUrl: document.getElementById('cfg-singbox-sub').value.trim(),
+            };
+
+            try {
+                const resp = await fetch('/api/config?password=' + encodeURIComponent(currentPassword), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const res = await resp.json();
+                if (res.success) {
+                    showToast(res.message || '配置已成功保存到 KV！');
+                    if (newPwd !== currentPassword) {
+                        currentPassword = newPwd;
+                        const newUrl = new URL(window.location);
+                        newUrl.searchParams.set('password', newPwd);
+                        window.history.replaceState({}, '', newUrl.toString());
+                    }
+                    setTimeout(() => { window.location.reload(); }, 1200);
+                } else {
+                    alert('保存失败: ' + (res.message || '未知错误'));
+                }
+            } catch (err) {
+                alert('保存网络异常: ' + err.message);
+            }
+        }
+
+        async function resetAdminConfig() {
+            if (!confirm('确定要清除 KV 中存储的配置并恢复为默认设置吗？')) {
+                return;
+            }
+            try {
+                const resp = await fetch('/api/reset?password=' + encodeURIComponent(currentPassword), {
+                    method: 'POST'
+                });
+                const res = await resp.json();
+                if (res.success) {
+                    showToast(res.message || '已重置为默认配置！');
+                    setTimeout(() => { window.location.reload(); }, 1200);
+                } else {
+                    alert('重置失败: ' + (res.message || '未知错误'));
+                }
+            } catch (err) {
+                alert('重置网络异常: ' + err.message);
+            }
         }
         
         function copySubscription() {
-            const configUrl = '${baseUrl}/${subPath}';
+            const configUrl = '${baseUrl}/${config.subPath}';
             navigator.clipboard.writeText(configUrl).then(() => {
-                showToast('V2rayN订阅链接已复制到剪贴板!');
+                showToast('全协议订阅链接已复制到剪贴板!');
             }).catch(() => {
                 const textArea = document.createElement('textarea');
                 textArea.value = configUrl;
@@ -1473,14 +2183,14 @@ function getMainPageContent(url, baseUrl) {
                 textArea.select();
                 document.execCommand('copy');
                 document.body.removeChild(textArea);
-                showToast('V2rayN订阅链接已复制到剪贴板!');
+                showToast('全协议订阅链接已复制到剪贴板!');
             });
         }
         
         function copyClashSubscription() {
-            const clashUrl = 'https://sublink.eooce.com/clash?config=${baseUrl}/${subPath}';
+            const clashUrl = '${clashFullUrl}';
             navigator.clipboard.writeText(clashUrl).then(() => {
-                showToast('Clash订阅链接已复制到剪贴板!');
+                showToast('Clash 订阅链接已复制到剪贴板!');
             }).catch(() => {
                 const textArea = document.createElement('textarea');
                 textArea.value = clashUrl;
@@ -1488,14 +2198,14 @@ function getMainPageContent(url, baseUrl) {
                 textArea.select();
                 document.execCommand('copy');
                 document.body.removeChild(textArea);
-                showToast('Clash订阅链接已复制到剪贴板!');
+                showToast('Clash 订阅链接已复制到剪贴板!');
             });
         }
         
         function copySingboxSubscription() {
-            const singboxUrl = 'https://sublink.eooce.com/singbox?config=${baseUrl}/${subPath}';
+            const singboxUrl = '${singboxFullUrl}';
             navigator.clipboard.writeText(singboxUrl).then(() => {
-                showToast('singbox订阅链接已复制到剪贴板!');
+                showToast('Sing-box 订阅链接已复制到剪贴板!');
             }).catch(() => {
                 const textArea = document.createElement('textarea');
                 textArea.value = singboxUrl;
@@ -1503,7 +2213,22 @@ function getMainPageContent(url, baseUrl) {
                 textArea.select();
                 document.execCommand('copy');
                 document.body.removeChild(textArea);
-                showToast('singbox订阅链接已复制到剪贴板!');
+                showToast('Sing-box 订阅链接已复制到剪贴板!');
+            });
+        }
+        
+        function copyQXConfig() {
+            const qx = '${qxFullConfig}';
+            navigator.clipboard.writeText(qx).then(() => {
+                showToast('Quantumult X 配置已复制!');
+            }).catch(() => {
+                const textArea = document.createElement('textarea');
+                textArea.value = qx;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+                showToast('Quantumult X 配置已复制!');
             });
         }
         
