@@ -44,39 +44,50 @@
 | `DISABLE_SS`或`CLOSE_SS` | 是否关闭Shadowsocks协议，true关闭，false开启 | `false` | 默认开启 |
 | `SSPATH`或`sspath` | Shadowsocks路径验证，为空则使用UUID作为验证路径 | 空 (使用UUID) | `mysecretpath` |
 
-## 部署步骤
+## 部署方式
+
+### 方式一：Cloudflare Pages 压缩包直接上传部署 (推荐，最便捷)
+
+1. **下载最新部署压缩包**
+   - 进入本项目的 [Releases 页面](../../releases/tag/latest) 下载最新的 **`pages.zip`** 资产文件。
+
+2. **上传部署到 Pages**
+   - 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)；
+   - 点击左侧 **"Workers & Pages"** -> 点击 **"Create application"**；
+   - 选择 **"Pages"** 标签页 -> 点击 **"Upload assets"**（直接上传资产）；
+   - 输入项目名称（如 `my-proxy-node`）；
+   - 将下载的 **`pages.zip`** 压缩包拖入上传区，点击 **"Deploy site"** 即可一键完成部署！
+
+3. **绑定 KV 命名空间（开启后台管理持久化配置）**
+   - 在左侧菜单点击 "Workers & Pages" -> "KV" 创建命名空间（如 `CF_VLESS_KV`）；
+   - 进入刚才部署好的 Pages 项目 -> 点击 **"Settings"** -> **"Variables and Secrets"**；
+   - 在 **"KV Namespace Bindings"** 处点击 **"Add binding"**；
+   - Variable name（变量名称）填写：`KV`，目标选择刚创建的 `CF_VLESS_KV` 并保存。
+
+4. **绑定自定义域名与访问**
+   - 在 Pages 项目设置中点击 **"Custom domains"** 绑定你的域名；
+   - 访问 `https://你的域名/` 输入密码查看节点；
+   - 访问 `https://你的域名/admin` 进入后台管理面板。
+
+---
+
+### 方式二：Cloudflare Workers 复制代码部署
 
 1. **登录 Cloudflare Dashboard**
-   - 访问 [Cloudflare Dashboard](https://dash.cloudflare.com/)
-   - 登录你的账户
+   - 访问 [Cloudflare Dashboard](https://dash.cloudflare.com/)，点击 "Workers & Pages" -> "Create application" -> 选择 "Create Worker"；
+   - 输入 Worker 名称，点击 "Deploy"；
 
-2. **创建 Worker**
-   - 点击 "Workers & Pages"
-   - 点击 "Create application"
-   - 选择 "Create Worker"
-   - 输入 Worker 名称(不要带vless,proxy之类的关键词，建议默认)
+2. **上传代码**
+   - 进入刚创建的 Worker，点击 "Edit code"；
+   - 将项目中的 `_worker.js` 文件全部内容复制并替换到编辑器中，点击右上角 "Deploy" 保存；
 
-3. **上传代码**
-   - 将 `_worker.js` 文件内容复制到编辑器
-   - 点击 右上角 "Deploy"
+3. **绑定 KV 命名空间（开启后台管理持久化配置）**
+   - 在左侧菜单点击 "Workers & Pages" -> "KV" 创建命名空间；
+   - 回到 Worker -> 点击 "Settings" -> "Variables and Secrets" -> "KV Namespace Bindings" 处添加绑定：变量名称为 `KV`；
 
-4. **绑定 KV 命名空间（开启后台管理持久化配置）**
-   - 在左侧菜单点击 "Workers & Pages" -> "KV"
-   - 点击 "Create namespace"，名称任意（例如 `CF_VLESS_KV`）
-   - 回到刚才创建的 Worker -> 点击 "Settings" -> "Variables and Secrets"
-   - 在 "KV Namespace Bindings" 处点击 "Add binding"
-   - Variable name（变量名称）填写：`KV`
-   - KV namespace 选择刚创建的 `CF_VLESS_KV`
-   - 点击 "Deploy" 保存
-
-5. **配置环境变量与域名**
-   - 在 Worker 设置中找到 "Settings" → "Variables"
-   - 添加所需的环境变量并绑定自定义域名
-   - 点击 "Save"
-
-6. **访问与后台管理使用**
-   - **前台节点与订阅 (`/`)**：直接访问你的 Worker 域名，输入 `PASSWORD`（默认 `123456`），即可查看节点信息、一键复制全协议/Clash/Sing-box/QX 订阅；
-   - **后台管理控制台 (`/admin`)**：访问 `域名/admin`，输入管理员密码 `ADMIN`（默认 `admin`），即可进入可视化后台，随时在线修改 UUID、前台密码、管理员密码、订阅路径、落地 ProxyIP、优选域名、订阅转换后端等，保存后由 KV 自动持久化并全网即时生效！
+4. **访问与后台管理使用**
+   - **前台节点与订阅 (`/`)**：访问你的 Worker 域名，输入 `PASSWORD`（默认 `123456`），即可查看节点信息、一键复制全协议/Clash/Sing-box/QX 订阅；
+   - **后台管理控制台 (`/admin`)**：访问 `域名/admin`，输入管理员密码 `ADMIN`（默认 `admin`），进入后台即可在线修改并持久化所有配置！
 
 ## snippets / workers 路径进阶用法
 

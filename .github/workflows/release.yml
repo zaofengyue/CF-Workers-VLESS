@@ -1,0 +1,56 @@
+name: Build and Release Pages Package
+
+on:
+  push:
+    branches:
+      - main
+      - beta
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Pages package
+        run: |
+          mkdir -p dist
+          cp _worker.js dist/_worker.js
+          echo "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Cloudflare Pages</title></head><body><h1>Cloudflare Pages Direct Upload</h1></body></html>" > dist/index.html
+          cd dist
+          zip -r ../pages.zip .
+          cd ..
+
+      - name: Publish or Update Latest Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "CF-Workers-VLESS 最新发布版 (Pages 部署包)"
+          body: |
+            ## 🚀 Cloudflare Pages 快速部署包 (最新版)
+            
+            这是系统自动构建生成的最新 Pages 部署压缩包。
+
+            ### 📦 部署使用说明：
+            1. 下载下方的 **`pages.zip`** 资产文件；
+            2. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)；
+            3. 点击 **Workers & Pages** -> **Create application** -> **Pages** -> **Upload assets**；
+            4. 输入项目名称，将下载的 `pages.zip` 拖拽或上传进去，点击 **Deploy site** 即可完成部署；
+            5. **绑定 KV 开启后台管理**（推荐）：
+               - 进入部署好的 Pages 项目设置 -> **Settings** -> **Variables and Secrets**；
+               - 在 **KV Namespace Bindings** 处添加变量名为 **`KV`** 的绑定（绑定已创建好的 KV 命名空间）；
+               - 在 **Environment Variables** 处可添加 `PASSWORD`、`ADMIN`、`UUID` 等自定义变量。
+            
+            ---
+            *最新构建提交: ${{ github.sha }}*
+          draft: false
+          prerelease: false
+          files: |
+            pages.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
