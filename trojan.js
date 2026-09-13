@@ -88,13 +88,7 @@ function parsePryAddress(serverStr) {
 }
 
 function isSpeedTestSite(hostname) {
-    const speedTestDomains = ['speedtest.net','fast.com','speedtest.cn','speed.cloudflare.com', 'ovo.speedtestcustom.com'];
-    if (speedTestDomains.includes(hostname)) { return true; }
-    for (const domain of speedTestDomains) {
-        if (hostname.endsWith('.' + domain) || hostname === domain) {
-            return true;
-        }
-    }
+    // 允许测速站点正常通行，解除测速阻断以测得真实带宽
     return false;
 }
 

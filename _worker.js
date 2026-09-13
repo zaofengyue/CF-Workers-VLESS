@@ -41,7 +41,16 @@ function getKV(env) {
     return env.KV || env.DATA_KV || env.CONFIG_KV || null;
 }
 
+let memoryConfigCache = null;
+let memoryConfigCacheTime = 0;
+const CACHE_TTL_MS = 30000; // 内存缓存 30 秒，极速 0ms 响应，大幅降低并发握手延迟
+
 async function loadConfig(env) {
+    const now = Date.now();
+    if (memoryConfigCache && (now - memoryConfigCacheTime < CACHE_TTL_MS)) {
+        return memoryConfigCache;
+    }
+
     let config = { ...DEFAULT_CONFIG, cfip: [...DEFAULT_CONFIG.cfip] };
 
     // 1. 环境变量覆盖
@@ -94,6 +103,9 @@ async function loadConfig(env) {
     if (config.subPath === 'link' || config.subPath === '') {
         config.subPath = config.yourUUID;
     }
+    
+    memoryConfigCache = config;
+    memoryConfigCacheTime = now;
     return config;
 }
 
@@ -103,6 +115,8 @@ async function saveConfig(env, newConfig) {
         throw new Error('未检测到绑定的 KV 命名空间，请先在 Cloudflare 控制台添加名为 KV 的变量绑定');
     }
     await kv.put('CONFIG', JSON.stringify(newConfig));
+    memoryConfigCache = null;
+    memoryConfigCacheTime = 0;
 }
 
 async function resetConfig(env) {
@@ -111,6 +125,8 @@ async function resetConfig(env) {
         throw new Error('未检测到绑定的 KV 命名空间');
     }
     await kv.delete('CONFIG');
+    memoryConfigCache = null;
+    memoryConfigCacheTime = 0;
 }
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
@@ -276,16 +292,7 @@ function parsePryAddress(serverStr) {
 }
 
 function isSpeedTestSite(hostname) {
-    const speedTestDomains = ['speedtest.net','fast.com','speedtest.cn','speed.cloudflare.com', 'ovo.speedtestcustom.com'];
-    if (speedTestDomains.includes(hostname)) {
-        return true;
-    }
-
-    for (const domain of speedTestDomains) {
-        if (hostname.endsWith('.' + domain) || hostname === domain) {
-            return true;
-        }
-    }
+    // 允许测速站点正常通行，解除测速阻断以测得真实带宽
     return false;
 }
 
@@ -663,11 +670,9 @@ export default {
  */
 async function handleVlsRequest(request, customProxyIP, validSSPath) {
     const wssPair = new WebSocketPair();
-    const clientSock = wssPair[0];
-    const serverSock = wssPair[1];
+    const [clientSock, serverSock] = Object.values(wssPair);
     serverSock.accept();
-    serverSock.binaryType = 'arraybuffer';
-    let remoteConnWrapper = { socket: null };
+    let remoteConnWrapper = { socket: null, writer: null };
     let isDnsQuery = false;
     let isTrojan = false;
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
@@ -680,10 +685,13 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
     readable.pipeTo(new WritableStream({
         async write(chunk) {
             if (isDnsQuery) return await forwardataudp(chunk, serverSock, null);
-            if (remoteConnWrapper.socket) {
+            if (remoteConnWrapper.writer) {
+                await remoteConnWrapper.writer.write(chunk);
+                return;
+            } else if (remoteConnWrapper.socket) {
                 const writer = remoteConnWrapper.socket.writable.getWriter();
+                remoteConnWrapper.writer = writer;
                 await writer.write(chunk);
-                writer.releaseLock();
                 return;
             }
             
@@ -1617,7 +1625,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         }
         
         remoteConnWrapper.socket = newSocket;
-        newSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
+        try {
+            remoteConnWrapper.writer = newSocket.writable.getWriter();
+        } catch (e) {}
         connectStreams(newSocket, ws, respHeader, null);
     }
     
@@ -1631,8 +1641,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         try {
             const initialSocket = await connectDirect(host, portNum, rawData);
             remoteConnWrapper.socket = initialSocket;
+            try {
+                remoteConnWrapper.writer = initialSocket.writable.getWriter();
+            } catch (e) {}
             connectStreams(initialSocket, ws, respHeader, connecttoPry);
         } catch (err) {
+            try { remoteConnWrapper.writer?.releaseLock(); } catch (e) {}
+            remoteConnWrapper.writer = null;
+            remoteConnWrapper.socket = null;
             await connecttoPry();
         }
     }
@@ -1715,13 +1731,8 @@ function makeReadableStr(socket, earlyDataHeader) {
     let cancelled = false;
     return new ReadableStream({
         start(controller) {
-            socket.addEventListener('message', async (event) => {
-                if (cancelled) return;
-                let data = event.data;
-                if (data instanceof Blob) {
-                    data = await data.arrayBuffer();
-                }
-                controller.enqueue(data);
+            socket.addEventListener('message', (event) => {
+                if (!cancelled) controller.enqueue(event.data);
             });
             socket.addEventListener('close', () => { 
                 if (!cancelled) { 
@@ -1731,13 +1742,8 @@ function makeReadableStr(socket, earlyDataHeader) {
             });
             socket.addEventListener('error', (err) => controller.error(err));
             const { earlyData, error } = base64ToArray(earlyDataHeader);
-            if (error) {
-                Promise.resolve().then(() => controller.error(error));
-            } else if (earlyData) {
-                Promise.resolve().then(() => {
-                    if (!cancelled) controller.enqueue(earlyData);
-                });
-            }
+            if (error) controller.error(error);
+            else if (earlyData) controller.enqueue(earlyData);
         },
         cancel() { 
             cancelled = true; 
