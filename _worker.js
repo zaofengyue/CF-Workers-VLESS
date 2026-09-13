@@ -672,7 +672,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
     serverSock.accept();
-    let remoteConnWrapper = { socket: null, writer: null };
+    let remoteConnWrapper = { socket: null };
     let isDnsQuery = false;
     let isTrojan = false;
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
@@ -685,13 +685,13 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
     readable.pipeTo(new WritableStream({
         async write(chunk) {
             if (isDnsQuery) return await forwardataudp(chunk, serverSock, null);
-            if (remoteConnWrapper.writer) {
-                await remoteConnWrapper.writer.write(chunk);
-                return;
-            } else if (remoteConnWrapper.socket) {
+            if (remoteConnWrapper.socket) {
                 const writer = remoteConnWrapper.socket.writable.getWriter();
-                remoteConnWrapper.writer = writer;
-                await writer.write(chunk);
+                try {
+                    await writer.write(chunk);
+                } finally {
+                    writer.releaseLock();
+                }
                 return;
             }
             
@@ -1625,9 +1625,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         }
         
         remoteConnWrapper.socket = newSocket;
-        try {
-            remoteConnWrapper.writer = newSocket.writable.getWriter();
-        } catch (e) {}
+        newSocket.closed?.catch(() => {}).finally(() => closeSocketQuietly(ws));
         connectStreams(newSocket, ws, respHeader, null);
     }
     
@@ -1641,13 +1639,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         try {
             const initialSocket = await connectDirect(host, portNum, rawData);
             remoteConnWrapper.socket = initialSocket;
-            try {
-                remoteConnWrapper.writer = initialSocket.writable.getWriter();
-            } catch (e) {}
             connectStreams(initialSocket, ws, respHeader, connecttoPry);
         } catch (err) {
-            try { remoteConnWrapper.writer?.releaseLock(); } catch (e) {}
-            remoteConnWrapper.writer = null;
             remoteConnWrapper.socket = null;
             await connecttoPry();
         }
@@ -1756,10 +1749,11 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
     let header = headerData, hasData = false;
     await remoteSocket.readable.pipeTo(
         new WritableStream({
-            async write(chunk) {
+            async write(chunk, controller) {
                 hasData = true;
                 if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-                    throw new Error('ws.readyState is not open');
+                    controller.error('ws.readyState is not open');
+                    return;
                 }
                 if (header) { 
                     const response = new Uint8Array(header.length + chunk.byteLength);
