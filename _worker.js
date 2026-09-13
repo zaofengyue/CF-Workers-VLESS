@@ -672,6 +672,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
     serverSock.accept();
+    serverSock.binaryType = 'arraybuffer';
     let remoteConnWrapper = { socket: null };
     let isDnsQuery = false;
     let isTrojan = false;
@@ -1724,8 +1725,13 @@ function makeReadableStr(socket, earlyDataHeader) {
     let cancelled = false;
     return new ReadableStream({
         start(controller) {
-            socket.addEventListener('message', (event) => {
-                if (!cancelled) controller.enqueue(event.data);
+            socket.addEventListener('message', async (event) => {
+                if (cancelled) return;
+                let data = event.data;
+                if (data instanceof Blob) {
+                    data = await data.arrayBuffer();
+                }
+                controller.enqueue(data);
             });
             socket.addEventListener('close', () => { 
                 if (!cancelled) { 
@@ -1735,8 +1741,13 @@ function makeReadableStr(socket, earlyDataHeader) {
             });
             socket.addEventListener('error', (err) => controller.error(err));
             const { earlyData, error } = base64ToArray(earlyDataHeader);
-            if (error) controller.error(error);
-            else if (earlyData) controller.enqueue(earlyData);
+            if (error) {
+                Promise.resolve().then(() => controller.error(error));
+            } else if (earlyData) {
+                Promise.resolve().then(() => {
+                    if (!cancelled) controller.enqueue(earlyData);
+                });
+            }
         },
         cancel() { 
             cancelled = true; 
@@ -1749,11 +1760,10 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
     let header = headerData, hasData = false;
     await remoteSocket.readable.pipeTo(
         new WritableStream({
-            async write(chunk, controller) {
+            async write(chunk) {
                 hasData = true;
                 if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-                    controller.error('ws.readyState is not open');
-                    return;
+                    throw new Error('ws.readyState is not open');
                 }
                 if (header) { 
                     const response = new Uint8Array(header.length + chunk.byteLength);
