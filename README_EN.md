@@ -4,9 +4,9 @@
 
 [中文](README.md) | **English**
 
-Telegram Discussion & Feedback Group: https://t.me/eooceu
+[ProxyIP Test](https://proxy.fengyue.bond) | [Socks5 Test](https://socks.fengyue.bond)
 
-High-performance VLESS+trojan proxy service based on Cloudflare Workers
+High-performance VLESS + Trojan + Shadowsocks proxy service based on Cloudflare Workers
 
 </div>
 
