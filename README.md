@@ -31,11 +31,12 @@ pages部署视频教程：https://www.youtube.com/watch?v=kNi6OwJ_e5k
 
 ## 环境变量配置
 
-### 必需变量
+### 必需/常用安全变量
 
 | 变量名 | 描述 | 默认值 | 示例 |
 |--------|------|--------|------|
-| `PASSWORD` | 主页访问密码 | `123456` | `your_web_password` |
+| `PASSWORD` | 前台用户页面访问密码 (查看节点和订阅) | `123456` | `your_web_password` |
+| `ADMIN`或`admin` | 后台管理控制台密码 (访问 `/admin`) | `admin` | `your_admin_password` |
 
 ### workers可选变量与 KV 绑定
 
@@ -43,7 +44,7 @@ pages部署视频教程：https://www.youtube.com/watch?v=kNi6OwJ_e5k
 |--------|------|--------|------|
 | `KV`或`DATA_KV`或`CONFIG_KV` | Cloudflare KV 命名空间变量绑定 | 空 | 用于后台持久化保存全部配置 |
 | `UUID`或`AUTH`或`uuid` | 用户UUID | `5dc15e15-f285-4a9d-959b-0e4fbdd77b63` | `your-uuid` |
-| `PROXYIP`或`proxyip`或`proxyIP` | 代理服务器IP列表 | `13.230.34.30` | `tw.tp81.netlib.re` |
+| `PROXYIP`或`proxyip`或`proxyIP` | 代理服务器IP列表 | `proxy.xxxxxxxx.tk:50001` | `tw.tp81.netlib.re` |
 | `SUB_PATH`或`subpath` | 订阅路径 | `link` | `sub` |
 | `DISABLE_TROJAN`或`CLOSE_TROJAN` | 是否关闭Trojan协议，true关闭，false开启 | `false` | 默认开启 |
 | `DISABLE_SS`或`CLOSE_SS` | 是否关闭Shadowsocks协议，true关闭，false开启 | `false` | 默认开启 |
@@ -79,9 +80,9 @@ pages部署视频教程：https://www.youtube.com/watch?v=kNi6OwJ_e5k
    - 添加所需的环境变量并绑定自定义域名
    - 点击 "Save"
 
-6. **访问自定义域名使用后台**
-   - 访问你的域名，输入登录密码进入主页
-   - 切换到 **“后台管理配置”** 选项卡，可直接可视化修改 UUID、密码、订阅路径、落地 ProxyIP、优选域名列表、订阅转换后端等，保存后即时生效！
+6. **访问与后台管理使用**
+   - **前台节点与订阅 (`/`)**：直接访问你的 Worker 域名，输入 `PASSWORD`（默认 `123456`），即可查看节点信息、一键复制全协议/Clash/Sing-box/QX 订阅；
+   - **后台管理控制台 (`/admin`)**：访问 `域名/admin`，输入管理员密码 `ADMIN`（默认 `admin`），即可进入可视化后台，随时在线修改 UUID、前台密码、管理员密码、订阅路径、落地 ProxyIP、优选域名、订阅转换后端等，保存后由 KV 自动持久化并全网即时生效！
 
 ## snippets / workers 路径进阶用法
 

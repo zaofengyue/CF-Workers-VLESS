@@ -12,6 +12,7 @@ import { connect } from 'cloudflare:sockets';
 const DEFAULT_CONFIG = {
     subPath: 'link',
     password: '123456',
+    adminPassword: 'admin',
     proxyIP: 'proxy.xxxxxxxx.tk:50001',
     yourUUID: '5dc15e15-f285-4a9d-959b-0e4fbdd77b63',
     disabletro: false,
@@ -27,6 +28,7 @@ const DEFAULT_CONFIG = {
 
 let subPath = DEFAULT_CONFIG.subPath;
 let password = DEFAULT_CONFIG.password;
+let adminPassword = DEFAULT_CONFIG.adminPassword;
 let proxyIP = DEFAULT_CONFIG.proxyIP;
 let yourUUID = DEFAULT_CONFIG.yourUUID;
 let disabletro = DEFAULT_CONFIG.disabletro;
@@ -46,6 +48,7 @@ async function loadConfig(env) {
     if (env) {
         if (env.UUID || env.uuid || env.AUTH) config.yourUUID = env.UUID || env.uuid || env.AUTH;
         if (env.PASSWORD || env.PASSWD || env.password) config.password = env.PASSWORD || env.PASSWD || env.password;
+        if (env.ADMIN || env.admin) config.adminPassword = env.ADMIN || env.admin;
         if (env.SUB_PATH || env.subpath) config.subPath = env.SUB_PATH || env.subpath;
         if (env.PROXYIP || env.proxyip || env.proxyIP) {
             const servers = (env.PROXYIP || env.proxyip || env.proxyIP).split(',').map(s => s.trim());
@@ -72,6 +75,8 @@ async function loadConfig(env) {
             if (kvData && typeof kvData === 'object') {
                 if (kvData.yourUUID) config.yourUUID = String(kvData.yourUUID).trim();
                 if (kvData.password) config.password = String(kvData.password).trim();
+                if (kvData.adminPassword) config.adminPassword = String(kvData.adminPassword).trim();
+                else if (kvData.ADMIN) config.adminPassword = String(kvData.ADMIN).trim();
                 if (kvData.subPath !== undefined && kvData.subPath !== null) config.subPath = String(kvData.subPath).trim();
                 if (kvData.proxyIP) config.proxyIP = String(kvData.proxyIP).trim();
                 if (Array.isArray(kvData.cfip) && kvData.cfip.length > 0) config.cfip = kvData.cfip.map(s => String(s).trim()).filter(Boolean);
@@ -317,11 +322,11 @@ export default {
             const url = new URL(request.url);
             const pathname = url.pathname;
             
-            // 1. 后台配置 API: /api/config
+            // 1. 后台配置 API: /api/config (需后台管理员密码 ADMIN 鉴权)
             if (pathname === '/api/config') {
                 const reqPassword = url.searchParams.get('password') || request.headers.get('x-password');
-                if (reqPassword !== config.password) {
-                    return new Response(JSON.stringify({ success: false, message: '身份鉴权失败，密码错误' }), {
+                if (reqPassword !== config.adminPassword) {
+                    return new Response(JSON.stringify({ success: false, message: '后台管理鉴权失败，密码错误' }), {
                         status: 401,
                         headers: { 'Content-Type': 'application/json; charset=utf-8' }
                     });
@@ -348,6 +353,7 @@ export default {
                         const updatedConfig = {
                             yourUUID: (body.yourUUID && String(body.yourUUID).trim()) || config.yourUUID,
                             password: (body.password && String(body.password).trim()) || config.password,
+                            adminPassword: (body.adminPassword && String(body.adminPassword).trim()) || config.adminPassword,
                             subPath: body.subPath !== undefined ? String(body.subPath).trim() : config.subPath,
                             proxyIP: (body.proxyIP && String(body.proxyIP).trim()) || config.proxyIP,
                             disabletro: body.disabletro === true || body.disabletro === 'true',
@@ -374,11 +380,11 @@ export default {
                 }
             }
 
-            // 2. 后台重置 API: /api/reset
+            // 2. 后台重置 API: /api/reset (需后台管理员密码 ADMIN 鉴权)
             if (pathname === '/api/reset' && request.method === 'POST') {
                 const reqPassword = url.searchParams.get('password') || request.headers.get('x-password');
-                if (reqPassword !== config.password) {
-                    return new Response(JSON.stringify({ success: false, message: '身份鉴权失败，密码错误' }), {
+                if (reqPassword !== config.adminPassword) {
+                    return new Response(JSON.stringify({ success: false, message: '后台管理鉴权失败，密码错误' }), {
                         status: 401,
                         headers: { 'Content-Type': 'application/json; charset=utf-8' }
                     });
@@ -428,9 +434,14 @@ export default {
                 const customProxyIP = pathProxyIP || url.searchParams.get('proxyip') || request.headers.get('proxyip');
                 return await handleVlsRequest(request, customProxyIP, validSSPath);
             } else if (request.method === 'GET') {
-                // 5. Web 首页与管理面板
+                // 5. 后台管理页面 (/admin - 需 ADMIN 密码验证)
+                if (url.pathname === '/admin' || url.pathname === '/admin/') {
+                    return getAdminPage(request, validSSPath, config, hasKV);
+                }
+
+                // 6. 前台节点与订阅页面 (/ - 需 PASSWORD 密码验证)
                 if (url.pathname === '/') {
-                    return getHomePage(request, validSSPath, config, hasKV);
+                    return getNodesPage(request, validSSPath, config, hasKV);
                 }
                 
                 // 6. 订阅输出
@@ -1096,19 +1107,50 @@ async function forwardataudp(udpChunk, webSocket, respHeader) {
  * @param {boolean} hasKV
  * @returns {Response}
  */
-function getHomePage(request, validSSPath, config, hasKV) {
+/**
+ * 前台节点与订阅页面入口 (/)
+ * @param {import("@cloudflare/workers-types").Request} request
+ * @param {string} validSSPath
+ * @param {object} config
+ * @param {boolean} hasKV
+ * @returns {Response}
+ */
+function getNodesPage(request, validSSPath, config, hasKV) {
 	const url = request.headers.get('Host');
 	const baseUrl = `https://${url}`;
 	const urlObj = new URL(request.url);
 	const providedPassword = urlObj.searchParams.get('password');
 	if (providedPassword) {
 		if (providedPassword === config.password) {
-			return getMainPageContent(url, baseUrl, validSSPath, config, hasKV);
+			return getNodesPageContent(url, baseUrl, validSSPath, config, hasKV);
 		} else {
-			return getLoginPage(url, baseUrl, true);
+			return getLoginPage(url, baseUrl, true, false);
 		}
 	}
-	return getLoginPage(url, baseUrl, false);
+	return getLoginPage(url, baseUrl, false, false);
+}
+
+/**
+ * 后台管理面板页面入口 (/admin)
+ * @param {import("@cloudflare/workers-types").Request} request
+ * @param {string} validSSPath
+ * @param {object} config
+ * @param {boolean} hasKV
+ * @returns {Response}
+ */
+function getAdminPage(request, validSSPath, config, hasKV) {
+	const url = request.headers.get('Host');
+	const baseUrl = `https://${url}`;
+	const urlObj = new URL(request.url);
+	const providedPassword = urlObj.searchParams.get('password');
+	if (providedPassword) {
+		if (providedPassword === config.adminPassword) {
+			return getAdminPageContent(url, baseUrl, validSSPath, config, hasKV);
+		} else {
+			return getLoginPage(url, baseUrl, true, true);
+		}
+	}
+	return getLoginPage(url, baseUrl, false, true);
 }
 
 /**
@@ -1116,15 +1158,20 @@ function getHomePage(request, validSSPath, config, hasKV) {
  * @param {string} url 
  * @param {string} baseUrl 
  * @param {boolean} showError 
+ * @param {boolean} isAdmin
  * @returns {Response}
  */
-function getLoginPage(url, baseUrl, showError = false) {
+function getLoginPage(url, baseUrl, showError = false, isAdmin = false) {
+    const title = isAdmin ? 'Workers Service - 后台管理登录' : 'Workers Service - 节点与订阅登录';
+    const subtitle = isAdmin ? '请输入后台管理密码 (ADMIN) 以访问管理控制台' : '请输入访问密码 (PASSWORD) 查看节点与订阅';
+
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Workers Service - 登录</title>
+    <title>${title}</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         * {
             margin: 0;
@@ -1134,7 +1181,7 @@ function getLoginPage(url, baseUrl, showError = false) {
         
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #7dd3ca 0%, #a17ec4 100%);
+            background: ${isAdmin ? 'linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4338ca 100%)' : 'linear-gradient(135deg, #7dd3ca 0%, #a17ec4 100%)'};
             height: 100vh;
             display: flex;
             align-items: center;
@@ -1146,46 +1193,50 @@ function getLoginPage(url, baseUrl, showError = false) {
         }
         
         .login-container {
-            background: rgba(255, 255, 255, 0.95);
+            background: rgba(255, 255, 255, 0.96);
             backdrop-filter: blur(10px);
             border-radius: 20px;
             padding: 40px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
-            max-width: 400px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+            max-width: 420px;
             width: 95%;
             text-align: center;
         }
         
         .logo {
-            margin-bottom: -20px;
-            background: linear-gradient(135deg, #7dd3ca 0%, #a17ec4 100%)
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            margin-bottom: -15px;
         }
         
         .title {
-            font-size: 1.8rem;
+            font-size: 1.7rem;
             margin-bottom: 8px;
-            color: #2d3748;
+            color: #1e293b;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .badge-admin {
+            display: inline-block;
+            background: #4f46e5;
+            color: white;
+            font-size: 0.72rem;
+            padding: 2px 8px;
+            border-radius: 6px;
+            vertical-align: middle;
         }
         
         .subtitle {
-            color: #718096;
-            margin-bottom: 30px;
-            font-size: 1rem;
+            color: #64748b;
+            margin-bottom: 26px;
+            font-size: 0.92rem;
+            line-height: 1.4;
         }
         
         .form-group {
             margin-bottom: 20px;
             text-align: left;
-        }
-        
-        .form-label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #4a5568;
         }
         
         .form-input {
@@ -1200,14 +1251,14 @@ function getLoginPage(url, baseUrl, showError = false) {
         
         .form-input:focus {
             outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+            border-color: ${isAdmin ? '#4f46e5' : '#12cd9e'};
+            box-shadow: 0 0 0 3px ${isAdmin ? 'rgba(79, 70, 229, 0.15)' : 'rgba(18, 205, 158, 0.15)'};
         }
         
         .btn-login {
             width: 100%;
             padding: 12px 20px;
-            background: linear-gradient(135deg, #12cd9e 0%, #a881d0 100%);
+            background: ${isAdmin ? 'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)' : 'linear-gradient(135deg, #12cd9e 0%, #a881d0 100%)'};
             color: white;
             border: none;
             border-radius: 8px;
@@ -1219,7 +1270,7 @@ function getLoginPage(url, baseUrl, showError = false) {
         
         .btn-login:hover {
             transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.15);
         }
         
         .error-message {
@@ -1229,12 +1280,21 @@ function getLoginPage(url, baseUrl, showError = false) {
             border-radius: 8px;
             margin-bottom: 20px;
             border-left: 4px solid #e53e3e;
+            font-size: 0.9rem;
         }
         
         .footer {
-            margin-top: 20px;
-            color: #718096;
-            font-size: 0.9rem;
+            margin-top: 22px;
+            color: #64748b;
+            font-size: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .footer a {
+            color: #4f46e5;
+            text-decoration: none;
         }
         
         @media (max-width: 480px) {
@@ -1242,24 +1302,19 @@ function getLoginPage(url, baseUrl, showError = false) {
                 padding: 30px 20px;
                 margin: 10px;
             }
-            
-            .logo {
-                font-size: 2.5rem;
-            }
-            
-            .title {
-                font-size: 1.5rem;
-            }
         }
     </style>
 </head>
 <body>
     <div class="login-container">
         <div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo"></div>
-        <h1 class="title">Workers Service</h1>
-        <p class="subtitle">请输入密码以访问服务</p>
+        <h1 class="title">
+            Workers Service
+            ${isAdmin ? '<span class="badge-admin">Admin</span>' : ''}
+        </h1>
+        <p class="subtitle">${subtitle}</p>
         
-        ${showError ? '<div class="error-message">密码错误,请重试</div>' : ''}
+        ${showError ? '<div class="error-message"><i class="fas fa-exclamation-circle"></i> 密码错误，请重试</div>' : ''}
         
         <form onsubmit="handleLogin(event)">
             <div class="form-group">
@@ -1268,16 +1323,20 @@ function getLoginPage(url, baseUrl, showError = false) {
                     id="password" 
                     name="password" 
                     class="form-input" 
-                    placeholder="请输入密码"
+                    placeholder="${isAdmin ? '请输入后台管理密码 (ADMIN)' : '请输入访问密码 (PASSWORD)'}"
                     required
                     autofocus
                 >
             </div>
-            <button type="submit" class="btn-login">登录</button>
+            <button type="submit" class="btn-login"><i class="fas fa-sign-in-alt"></i> 登录</button>
         </form>
         
         <div class="footer">
-            <p>Powered by eooce <a href="https://t.me/eooceu" target="_blank" style="color: #007bff; text-decoration: none;">Join Telegram group</a></p>
+            ${isAdmin ? 
+                `<div><a href="/"><i class="fas fa-arrow-left"></i> 返回前台节点与订阅</a></div>` : 
+                `<div><a href="/admin"><i class="fas fa-cog"></i> 访问后台管理面板 (/admin)</a></div>`
+            }
+            <div>Powered by eooce <a href="https://t.me/eooceu" target="_blank">Join Telegram</a></div>
         </div>
     </div>
     
@@ -1303,7 +1362,7 @@ function getLoginPage(url, baseUrl, showError = false) {
 }
 
 /**
- * 获取主页内容(密码验证通过后显示)
+ * 获取前台节点与订阅页面 (访问 / 且输入 PASSWORD 成功后展示)
  * @param {string} url 
  * @param {string} baseUrl 
  * @param {string} validSSPath
@@ -1311,7 +1370,7 @@ function getLoginPage(url, baseUrl, showError = false) {
  * @param {boolean} hasKV
  * @returns {Response}
  */
-function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
+function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
     const clashFullUrl = `${config.clashSubUrl || 'https://sublink.eooce.com/clash?config='}${baseUrl}/${config.subPath}`;
     const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.eooce.com/singbox?config='}${baseUrl}/${config.subPath}`;
     const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=none,password=${config.yourUUID},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
@@ -1321,7 +1380,7 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Workers Service - 管理面板</title>
+    <title>Workers Service - 节点与订阅</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         * {
@@ -1386,10 +1445,6 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
         
         .logo {
             margin-bottom: -10px;
-            background: linear-gradient(45deg, #667eea, #764ba2);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
         }
         
         .title {
@@ -1404,58 +1459,6 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
             font-size: 0.95rem;
         }
 
-        /* 标签页切换导航 */
-        .nav-tabs {
-            display: flex;
-            gap: 12px;
-            justify-content: center;
-            margin-bottom: 16px;
-            border-bottom: 2px solid #e2e8f0;
-            padding-bottom: 10px;
-        }
-
-        .nav-tab {
-            background: #f1f5f9;
-            border: 1px solid #cbd5e1;
-            font-size: 0.95rem;
-            font-weight: 600;
-            color: #64748b;
-            padding: 9px 20px;
-            border-radius: 10px;
-            cursor: pointer;
-            transition: all 0.25s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .nav-tab:hover {
-            background: #e2e8f0;
-            color: #334155;
-        }
-
-        .nav-tab.active {
-            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-            color: white;
-            border-color: transparent;
-            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
-        }
-
-        .tab-content {
-            display: none;
-            animation: fadeIn 0.3s ease;
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(4px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        /* 节点展示卡片 */
         .info-card {
             background: #f8fafc;
             border-radius: 12px;
@@ -1519,19 +1522,9 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
             transition: all 0.3s ease;
         }
         
-        .btn-primary {
-            background: linear-gradient(45deg, #4f46e5, #7c3aed);
-            color: white;
-        }
-        
         .btn-secondary {
             background: linear-gradient(45deg, #68e3d6, #906cc9);
             color: #001379;
-        }
-
-        .btn-danger {
-            background: linear-gradient(45deg, #ef4444, #dc2626);
-            color: white;
         }
         
         .btn:hover {
@@ -1554,8 +1547,450 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
             50% { opacity: 0.5; }
             100% { opacity: 1; }
         }
+        
+        .footer {
+            margin-top: 15px;
+            color: #718096;
+            font-size: 0.9rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .footer-links {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        
+        .footer-link {
+            color: #667eea;
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }
+        
+        .footer-link:hover {
+            background: rgba(102, 126, 234, 0.1);
+            transform: translateY(-1px);
+        }
 
-        /* 后台设置面板样式 */
+        .admin-link {
+            color: #4f46e5;
+            background: #eef2ff;
+            border: 1px solid #c7d2fe;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 6px;
+            transition: all 0.2s ease;
+        }
+
+        .admin-link:hover {
+            background: #e0e7ff;
+            transform: translateY(-1px);
+        }
+        
+        .github-icon {
+            width: 16px;
+            height: 16px;
+            fill: currentColor;
+        }
+        
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #ffffff;
+            border-left: 4px solid #10b981;
+            border-radius: 8px;
+            padding: 12px 18px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            z-index: 1100;
+            opacity: 0;
+            transform: translateX(100%);
+            transition: all 0.3s ease;
+            max-width: 320px;
+        }
+        
+        .toast.show {
+            opacity: 1;
+            transform: translateX(0);
+        }
+        
+        .toast-icon {
+            width: 22px;
+            height: 22px;
+            background: #10b981;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            flex-shrink: 0;
+        }
+        
+        .toast-message {
+            color: #1e293b;
+            font-size: 14px;
+            font-weight: 500;
+            text-align: left;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 16px;
+                margin: 8px;
+                max-height: 94vh;
+            }
+            
+            .info-item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 4px;
+            }
+            
+            .value {
+                margin-left: 0;
+                text-align: left;
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <button onclick="logout()" class="logout-btn">
+        <i class="fas fa-sign-out-alt"></i>
+        <span>退出</span>
+    </button>
+    
+    <div class="container">
+        <div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo"></div>
+        <h1 class="title">Workers Service</h1>
+        <p class="subtitle">基于 Cloudflare Workers 的高性能网络服务 (VLESS + Trojan + Shadowsocks)</p>
+
+        <div class="info-card">
+            <div class="info-item">
+                <span class="label">服务状态</span>
+                <span class="value"><span class="status"></span>运行中</span>
+            </div>
+            <div class="info-item">
+                <span class="label">主机地址</span>
+                <span class="value">${url}</span>
+            </div>
+            <div class="info-item">
+                <span class="label">UUID</span>
+                <span class="value">${config.yourUUID}</span>
+            </div>
+            <div class="info-item">
+                <span class="label">SS 节点路径</span>
+                <span class="value">${validSSPath}/?ed=2560</span>
+            </div>
+            <div class="info-item">
+                <span class="label">全协议订阅地址</span>
+                <span class="value">${baseUrl}/${config.subPath}</span>
+            </div>
+            <div class="info-item">
+                <span class="label">Clash 订阅地址</span>
+                <span class="value">${clashFullUrl}</span>
+            </div>
+            <div class="info-item">
+                <span class="label">Sing-box 订阅地址</span>
+                <span class="value">${singboxFullUrl}</span>
+            </div>
+        </div>
+        
+        <div class="button-group">
+            <button onclick="copySingboxSubscription()" class="btn btn-secondary">
+                <i class="fas fa-cube"></i> 复制 Sing-box 订阅
+            </button>
+            <button onclick="copyClashSubscription()" class="btn btn-secondary">
+                <i class="fas fa-cat"></i> 复制 Clash 订阅
+            </button>
+            <button onclick="copySubscription()" class="btn btn-secondary">
+                <i class="fas fa-link"></i> 复制全部节点订阅
+            </button>
+            <button onclick="copyQXConfig()" class="btn btn-secondary">
+                <i class="fas fa-paper-plane"></i> 复制 Quantumult X 配置
+            </button>
+        </div>
+        
+        <div class="footer">
+            <div>
+                <a href="/admin" class="admin-link">
+                    <i class="fas fa-user-shield"></i> 进入后台管理面板 (/admin)
+                </a>
+            </div>
+            <div class="footer-links">
+                <a href="https://github.com/eooce/CF-Workers-VLESS" target="_blank" class="footer-link">
+                    <svg class="github-icon" viewBox="0 0 24 24">
+                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.479-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                    </svg>
+                    <span>GitHub 项目</span>
+                </a>
+                <a href="https://check-proxyip.ssss.nyc.mn/" target="_blank" class="footer-link">
+                    <span>✅</span>
+                    <span>Proxyip 检测服务</span>
+                </a>
+                <a href="https://t.me/eooceu" target="_blank" class="footer-link">
+                    <span>📱</span>
+                    <span>Telegram 反馈交流群</span>
+                </a>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function showToast(message) {
+            const existingToast = document.querySelector('.toast');
+            if (existingToast) existingToast.remove();
+            
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            toast.innerHTML = '<div class="toast-icon">✓</div><div class="toast-message">' + message + '</div>';
+            document.body.appendChild(toast);
+            
+            setTimeout(() => { toast.classList.add('show'); }, 10);
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 300);
+            }, 1800);
+        }
+
+        function copySubscription() {
+            const configUrl = '${baseUrl}/${config.subPath}';
+            copyText(configUrl, '全协议订阅链接已复制到剪贴板!');
+        }
+        
+        function copyClashSubscription() {
+            const clashUrl = '${clashFullUrl}';
+            copyText(clashUrl, 'Clash 订阅链接已复制到剪贴板!');
+        }
+        
+        function copySingboxSubscription() {
+            const singboxUrl = '${singboxFullUrl}';
+            copyText(singboxUrl, 'Sing-box 订阅链接已复制到剪贴板!');
+        }
+        
+        function copyQXConfig() {
+            const qx = '${qxFullConfig}';
+            copyText(qx, 'Quantumult X 配置已复制!');
+        }
+
+        function copyText(text, msg) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast(msg);
+            }).catch(() => {
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+                showToast(msg);
+            });
+        }
+        
+        function logout() {
+            if (confirm('确定要退出登录吗?')) {
+                const currentUrl = new URL(window.location);
+                currentUrl.searchParams.delete('password');
+                window.location.href = currentUrl.toString();
+            }
+        }
+    </script>
+</body>
+</html>`;
+
+	return new Response(html, {
+		status: 200,
+		headers: {
+			'Content-Type': 'text/html;charset=utf-8',
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+		},
+	});
+}
+
+/**
+ * 获取后台管理面板页面 (访问 /admin 且输入 ADMIN 密码成功后展示)
+ * @param {string} url 
+ * @param {string} baseUrl 
+ * @param {string} validSSPath
+ * @param {object} config
+ * @param {boolean} hasKV
+ * @returns {Response}
+ */
+function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
+    const clashFullUrl = `${config.clashSubUrl || 'https://sublink.eooce.com/clash?config='}${baseUrl}/${config.subPath}`;
+    const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.eooce.com/singbox?config='}${baseUrl}/${config.subPath}`;
+    const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=none,password=${config.yourUUID},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
+
+	const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workers Service - 后台管理控制台</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4338ca 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #1e293b;
+            margin: 0;
+            padding: 15px 0;
+        }
+        
+        .container {
+            background: rgba(255, 255, 255, 0.98);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 24px;
+            box-shadow: 0 20px 45px rgba(0, 0, 0, 0.3);
+            max-width: 860px;
+            width: 95%;
+            max-height: 92vh;
+            text-align: center;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+        
+        .logout-btn {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #fee2e2;
+            color: #b91c1c;
+            border: 1px solid #fca5a5;
+            border-radius: 8px;
+            padding: 8px 16px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            z-index: 1000;
+        }
+        
+        .logout-btn:hover {
+            background: #fecaca;
+            transform: translateY(-1px);
+        }
+        
+        .logo {
+            margin-bottom: -10px;
+        }
+        
+        .title {
+            font-size: 1.8rem;
+            margin-bottom: 6px;
+            color: #1e293b;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .badge-admin {
+            background: #4f46e5;
+            color: white;
+            font-size: 0.75rem;
+            padding: 3px 10px;
+            border-radius: 6px;
+            font-weight: 600;
+        }
+        
+        .subtitle {
+            color: #64748b;
+            margin-bottom: 16px;
+            font-size: 0.95rem;
+        }
+
+        /* 标签页切换导航 */
+        .nav-tabs {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            margin-bottom: 16px;
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 10px;
+        }
+
+        .nav-tab {
+            background: #f1f5f9;
+            border: 1px solid #cbd5e1;
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #64748b;
+            padding: 9px 20px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .nav-tab:hover {
+            background: #e2e8f0;
+            color: #334155;
+        }
+
+        .nav-tab.active {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            border-color: transparent;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+        }
+
+        .tab-content {
+            display: none;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* KV 状态条 */
         .badge-kv {
             display: flex;
             align-items: flex-start;
@@ -1682,7 +2117,6 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
             color: #64748b;
         }
 
-        /* 开关切换滑块 */
         .switch {
             position: relative;
             display: inline-block;
@@ -1726,6 +2160,98 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
         input:checked + .slider:before {
             transform: translateX(22px);
         }
+
+        .button-group {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin: 16px 0;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(45deg, #4f46e5, #7c3aed);
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: #e2e8f0;
+            color: #1e293b;
+        }
+
+        .btn-danger {
+            background: linear-gradient(45deg, #ef4444, #dc2626);
+            color: white;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.15);
+        }
+
+        .info-card {
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 16px;
+            margin: 10px 0;
+            border-left: 4px solid #6366f1;
+            text-align: left;
+        }
+        
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #e2e8f0;
+            font-size: 0.9rem;
+        }
+        
+        .info-item:last-child {
+            border-bottom: none;
+        }
+        
+        .label {
+            font-weight: 600;
+            color: #4a5568;
+            flex-shrink: 0;
+        }
+        
+        .value {
+            color: rgb(20, 23, 29);
+            font-family: 'Courier New', monospace;
+            background: #edf2f7;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.82rem;
+            word-break: break-all;
+            margin-left: 12px;
+            text-align: right;
+        }
+
+        .status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #48bb78;
+            margin-right: 6px;
+        }
         
         .footer {
             margin-top: 15px;
@@ -1746,7 +2272,7 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
         }
         
         .footer-link {
-            color: #667eea;
+            color: #6366f1;
             text-decoration: none;
             display: flex;
             align-items: center;
@@ -1758,16 +2284,9 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
         }
         
         .footer-link:hover {
-            background: rgba(102, 126, 234, 0.1);
-            transform: translateY(-1px);
+            background: rgba(99, 102, 241, 0.1);
         }
-        
-        .github-icon {
-            width: 16px;
-            height: 16px;
-            fill: currentColor;
-        }
-        
+
         .toast {
             position: fixed;
             top: 20px;
@@ -1835,90 +2354,35 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
             .form-grid {
                 grid-template-columns: 1fr;
             }
-
-            .nav-tab {
-                padding: 8px 14px;
-                font-size: 0.85rem;
-            }
         }
     </style>
 </head>
 <body>
     <button onclick="logout()" class="logout-btn">
         <i class="fas fa-sign-out-alt"></i>
-        <span>退出登录</span>
+        <span>退出管理</span>
     </button>
     
     <div class="container">
         <div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo"></div>
-        <h1 class="title">Workers Service</h1>
-        <p class="subtitle">基于 Cloudflare Workers 的高性能网络服务 (VLESS + Trojan + Shadowsocks)</p>
+        <h1 class="title">
+            Workers Service
+            <span class="badge-admin">Admin 控制台</span>
+        </h1>
+        <p class="subtitle">Cloudflare Workers 后台管理面板与全局 KV 配置中心</p>
 
         <!-- 标签页导航 -->
         <div class="nav-tabs">
-            <button type="button" class="nav-tab active" id="tab-btn-nodes" onclick="switchTab('nodes')">
-                <i class="fas fa-network-wired"></i> 节点与订阅
+            <button type="button" class="nav-tab active" id="tab-btn-admin" onclick="switchTab('admin')">
+                <i class="fas fa-sliders-h"></i> 后台配置中心
             </button>
-            <button type="button" class="nav-tab" id="tab-btn-admin" onclick="switchTab('admin')">
-                <i class="fas fa-sliders-h"></i> 后台管理配置
+            <button type="button" class="nav-tab" id="tab-btn-nodes" onclick="switchTab('nodes')">
+                <i class="fas fa-network-wired"></i> 节点与订阅预览
             </button>
-        </div>
-        
-        <!-- Tab 1: 节点与订阅 -->
-        <div id="tab-nodes" class="tab-content active">
-            <div class="info-card">
-                <div class="info-item">
-                    <span class="label">服务状态</span>
-                    <span class="value"><span class="status"></span>运行中</span>
-                </div>
-                <div class="info-item">
-                    <span class="label">KV 存储状态</span>
-                    <span class="value">${hasKV ? '<span style="color:#059669;font-weight:bold;">已连接 (配置持久化)</span>' : '<span style="color:#d97706;font-weight:bold;">未绑定 (环境变量/默认)</span>'}</span>
-                </div>
-                <div class="info-item">
-                    <span class="label">主机地址</span>
-                    <span class="value">${url}</span>
-                </div>
-                <div class="info-item">
-                    <span class="label">UUID</span>
-                    <span class="value">${config.yourUUID}</span>
-                </div>
-                <div class="info-item">
-                    <span class="label">SS 节点路径</span>
-                    <span class="value">${validSSPath}/?ed=2560</span>
-                </div>
-                <div class="info-item">
-                    <span class="label">全协议订阅地址</span>
-                    <span class="value">${baseUrl}/${config.subPath}</span>
-                </div>
-                <div class="info-item">
-                    <span class="label">Clash 订阅地址</span>
-                    <span class="value">${clashFullUrl}</span>
-                </div>
-                <div class="info-item">
-                    <span class="label">Sing-box 订阅地址</span>
-                    <span class="value">${singboxFullUrl}</span>
-                </div>
-            </div>
-            
-            <div class="button-group">
-                <button onclick="copySingboxSubscription()" class="btn btn-secondary">
-                    <i class="fas fa-cube"></i> 复制 Sing-box 订阅
-                </button>
-                <button onclick="copyClashSubscription()" class="btn btn-secondary">
-                    <i class="fas fa-cat"></i> 复制 Clash 订阅
-                </button>
-                <button onclick="copySubscription()" class="btn btn-secondary">
-                    <i class="fas fa-link"></i> 复制全部节点订阅
-                </button>
-                <button onclick="copyQXConfig()" class="btn btn-secondary">
-                    <i class="fas fa-paper-plane"></i> 复制 Quantumult X 配置
-                </button>
-            </div>
         </div>
 
-        <!-- Tab 2: 后台管理配置 -->
-        <div id="tab-admin" class="tab-content">
+        <!-- Tab 1: 后台管理配置 -->
+        <div id="tab-admin" class="tab-content active">
             ${hasKV ? `
             <div class="badge-kv connected">
                 <i class="fas fa-check-circle"></i>
@@ -1942,22 +2406,27 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
 
             <!-- 基础设置 -->
             <div class="config-card">
-                <h3><i class="fas fa-key"></i> 基础认证与订阅路径</h3>
+                <h3><i class="fas fa-key"></i> 认证与密码设置</h3>
                 <div class="form-grid">
                     <div class="form-group">
-                        <label for="cfg-uuid">用户 UUID</label>
-                        <input type="text" id="cfg-uuid" class="form-input" value="${config.yourUUID}" placeholder="例如: 5dc15e15-f285-4a9d-959b-0e4fbdd77b63">
-                        <span class="form-hint">客户端连接节点使用的 UUID 密钥</span>
+                        <label for="cfg-admin-password">后台管理密码 (ADMIN)</label>
+                        <input type="text" id="cfg-admin-password" class="form-input" value="${config.adminPassword}" placeholder="后台管理密码">
+                        <span class="form-hint">进入此 /admin 后台管理面板的密码</span>
                     </div>
                     <div class="form-group">
-                        <label for="cfg-password">后台管理密码</label>
-                        <input type="text" id="cfg-password" class="form-input" value="${config.password}" placeholder="网页访问管理密码">
-                        <span class="form-hint">登录管理面板所用的密码</span>
+                        <label for="cfg-password">前台访问密码 (PASSWORD)</label>
+                        <input type="text" id="cfg-password" class="form-input" value="${config.password}" placeholder="前台页面密码">
+                        <span class="form-hint">用户访问首页 / 查看节点订阅所用的密码</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-uuid">用户 UUID</label>
+                        <input type="text" id="cfg-uuid" class="form-input" value="${config.yourUUID}" placeholder="客户端连接使用的 UUID">
+                        <span class="form-hint">VLESS / Trojan / Shadowsocks 鉴权 UUID</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-subpath">节点订阅路径 (SUB_PATH)</label>
                         <input type="text" id="cfg-subpath" class="form-input" value="${config.subPath}" placeholder="如 link 或自定义字符串">
-                        <span class="form-hint">访问 /路径 获取节点，留空将默认使用 UUID</span>
+                        <span class="form-hint">客户端订阅获取路径 /${config.subPath}</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-sspath">Shadowsocks 验证路径 (SSPATH)</label>
@@ -2038,14 +2507,65 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 </button>
             </div>
         </div>
+
+        <!-- Tab 2: 节点与订阅预览 -->
+        <div id="tab-nodes" class="tab-content">
+            <div class="info-card">
+                <div class="info-item">
+                    <span class="label">服务状态</span>
+                    <span class="value"><span class="status"></span>运行中</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">主机地址</span>
+                    <span class="value">${url}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">UUID</span>
+                    <span class="value">${config.yourUUID}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">SS 节点路径</span>
+                    <span class="value">${validSSPath}/?ed=2560</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">全协议订阅地址</span>
+                    <span class="value">${baseUrl}/${config.subPath}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Clash 订阅地址</span>
+                    <span class="value">${clashFullUrl}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Sing-box 订阅地址</span>
+                    <span class="value">${singboxFullUrl}</span>
+                </div>
+            </div>
+            
+            <div class="button-group">
+                <button onclick="copySingboxSubscription()" class="btn btn-secondary">
+                    <i class="fas fa-cube"></i> 复制 Sing-box 订阅
+                </button>
+                <button onclick="copyClashSubscription()" class="btn btn-secondary">
+                    <i class="fas fa-cat"></i> 复制 Clash 订阅
+                </button>
+                <button onclick="copySubscription()" class="btn btn-secondary">
+                    <i class="fas fa-link"></i> 复制全部节点订阅
+                </button>
+                <button onclick="copyQXConfig()" class="btn btn-secondary">
+                    <i class="fas fa-paper-plane"></i> 复制 Quantumult X 配置
+                </button>
+            </div>
+        </div>
         
         <div class="footer">
             <div class="footer-links">
+                <a href="/" class="footer-link">
+                    <i class="fas fa-external-link-alt"></i>
+                    <span>返回前台用户页面</span>
+                </a>
                 <a href="https://github.com/eooce/CF-Workers-VLESS" target="_blank" class="footer-link">
-                    <svg class="github-icon" viewBox="0 0 24 24">
-                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.479-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-                    </svg>
-                    <span>GitHub 项目地址</span>
+                    <i class="fab fa-github"></i>
+                    <span>GitHub 项目</span>
                 </a>
                 <a href="https://check-proxyip.ssss.nyc.mn/" target="_blank" class="footer-link">
                     <span>✅</span>
@@ -2060,7 +2580,7 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
     </div>
     
     <script>
-        let currentPassword = '${config.password}';
+        let currentAdminPassword = '${config.adminPassword}';
 
         function switchTab(tabName) {
             document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
@@ -2076,48 +2596,30 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
 
         function showToast(message) {
             const existingToast = document.querySelector('.toast');
-            if (existingToast) {
-                existingToast.remove();
-            }
+            if (existingToast) existingToast.remove();
             
             const toast = document.createElement('div');
             toast.className = 'toast';
-            
-            const icon = document.createElement('div');
-            icon.className = 'toast-icon';
-            icon.textContent = '✓';
-            
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'toast-message';
-            messageDiv.textContent = message;
-            
-            toast.appendChild(icon);
-            toast.appendChild(messageDiv);
-            
+            toast.innerHTML = '<div class="toast-icon">✓</div><div class="toast-message">' + message + '</div>';
             document.body.appendChild(toast);
             
-            setTimeout(() => {
-                toast.classList.add('show');
-            }, 10);
-            
+            setTimeout(() => { toast.classList.add('show'); }, 10);
             setTimeout(() => {
                 toast.classList.remove('show');
-                setTimeout(() => {
-                    if (toast.parentNode) {
-                        toast.parentNode.removeChild(toast);
-                    }
-                }, 300);
+                setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 300);
             }, 1800);
         }
 
         async function saveAdminConfig() {
             const cfipRaw = document.getElementById('cfg-cfip').value;
             const cfipList = cfipRaw.split('\\n').map(s => s.trim()).filter(Boolean);
-            const newPwd = document.getElementById('cfg-password').value.trim();
+            const newAdminPwd = document.getElementById('cfg-admin-password').value.trim();
+            const newUserPwd = document.getElementById('cfg-password').value.trim();
             
             const payload = {
+                adminPassword: newAdminPwd,
+                password: newUserPwd,
                 yourUUID: document.getElementById('cfg-uuid').value.trim(),
-                password: newPwd,
                 subPath: document.getElementById('cfg-subpath').value.trim(),
                 SSpath: document.getElementById('cfg-sspath').value.trim(),
                 disabletro: !document.getElementById('cfg-trojan').checked,
@@ -2129,7 +2631,7 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
             };
 
             try {
-                const resp = await fetch('/api/config?password=' + encodeURIComponent(currentPassword), {
+                const resp = await fetch('/api/config?password=' + encodeURIComponent(currentAdminPassword), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
@@ -2137,10 +2639,10 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 const res = await resp.json();
                 if (res.success) {
                     showToast(res.message || '配置已成功保存到 KV！');
-                    if (newPwd !== currentPassword) {
-                        currentPassword = newPwd;
+                    if (newAdminPwd && newAdminPwd !== currentAdminPassword) {
+                        currentAdminPassword = newAdminPwd;
                         const newUrl = new URL(window.location);
-                        newUrl.searchParams.set('password', newPwd);
+                        newUrl.searchParams.set('password', newAdminPwd);
                         window.history.replaceState({}, '', newUrl.toString());
                     }
                     setTimeout(() => { window.location.reload(); }, 1200);
@@ -2157,7 +2659,7 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 return;
             }
             try {
-                const resp = await fetch('/api/reset?password=' + encodeURIComponent(currentPassword), {
+                const resp = await fetch('/api/reset?password=' + encodeURIComponent(currentAdminPassword), {
                     method: 'POST'
                 });
                 const res = await resp.json();
@@ -2174,66 +2676,40 @@ function getMainPageContent(url, baseUrl, validSSPath, config, hasKV) {
         
         function copySubscription() {
             const configUrl = '${baseUrl}/${config.subPath}';
-            navigator.clipboard.writeText(configUrl).then(() => {
-                showToast('全协议订阅链接已复制到剪贴板!');
-            }).catch(() => {
-                const textArea = document.createElement('textarea');
-                textArea.value = configUrl;
-                document.body.appendChild(textArea);
-                textArea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textArea);
-                showToast('全协议订阅链接已复制到剪贴板!');
-            });
+            copyText(configUrl, '全协议订阅链接已复制到剪贴板!');
         }
         
         function copyClashSubscription() {
             const clashUrl = '${clashFullUrl}';
-            navigator.clipboard.writeText(clashUrl).then(() => {
-                showToast('Clash 订阅链接已复制到剪贴板!');
-            }).catch(() => {
-                const textArea = document.createElement('textarea');
-                textArea.value = clashUrl;
-                document.body.appendChild(textArea);
-                textArea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textArea);
-                showToast('Clash 订阅链接已复制到剪贴板!');
-            });
+            copyText(clashUrl, 'Clash 订阅链接已复制到剪贴板!');
         }
         
         function copySingboxSubscription() {
             const singboxUrl = '${singboxFullUrl}';
-            navigator.clipboard.writeText(singboxUrl).then(() => {
-                showToast('Sing-box 订阅链接已复制到剪贴板!');
-            }).catch(() => {
-                const textArea = document.createElement('textarea');
-                textArea.value = singboxUrl;
-                document.body.appendChild(textArea);
-                textArea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textArea);
-                showToast('Sing-box 订阅链接已复制到剪贴板!');
-            });
+            copyText(singboxUrl, 'Sing-box 订阅链接已复制到剪贴板!');
         }
         
         function copyQXConfig() {
             const qx = '${qxFullConfig}';
-            navigator.clipboard.writeText(qx).then(() => {
-                showToast('Quantumult X 配置已复制!');
+            copyText(qx, 'Quantumult X 配置已复制!');
+        }
+
+        function copyText(text, msg) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast(msg);
             }).catch(() => {
                 const textArea = document.createElement('textarea');
-                textArea.value = qx;
+                textArea.value = text;
                 document.body.appendChild(textArea);
                 textArea.select();
                 document.execCommand('copy');
                 document.body.removeChild(textArea);
-                showToast('Quantumult X 配置已复制!');
+                showToast(msg);
             });
         }
         
         function logout() {
-            if (confirm('确定要退出登录吗?')) {
+            if (confirm('确定要退出管理面板吗?')) {
                 const currentUrl = new URL(window.location);
                 currentUrl.searchParams.delete('password');
                 window.location.href = currentUrl.toString();
