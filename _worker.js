@@ -31,6 +31,7 @@ let password = DEFAULT_CONFIG.password;
 let adminPassword = DEFAULT_CONFIG.adminPassword;
 let proxyIP = DEFAULT_CONFIG.proxyIP;
 let yourUUID = DEFAULT_CONFIG.yourUUID;
+let yourUUIDBytes = null;
 let disabletro = DEFAULT_CONFIG.disabletro;
 let disabless = DEFAULT_CONFIG.disabless;
 let SSpath = DEFAULT_CONFIG.SSpath;
@@ -131,12 +132,177 @@ async function resetConfig(env) {
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 function closeSocketQuietly(socket) { 
+    if (!socket) return;
     try { 
-        if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
-            socket.close(); 
+        if (typeof socket.close === 'function') {
+            if (socket.readyState !== undefined) {
+                if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
+                    socket.close(); 
+                }
+            } else {
+                socket.close();
+            }
         }
     } catch (error) {} 
 }
+
+const GRAIN_CFG = {
+    chunk: 64 * 1024,
+    dnPack: 32 * 1024,
+    dnTail: 512,
+    dnQr: 4,
+    upPack: 20 * 1024,
+    concur: 4
+};
+
+function uuidToBytes(uuidStr) {
+    if (!uuidStr || typeof uuidStr !== 'string') return null;
+    const clean = uuidStr.replace(/-/g, '').toLowerCase();
+    if (clean.length !== 32) return null;
+    const bytes = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) {
+        const val = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
+        if (isNaN(val)) return null;
+        bytes[i] = val;
+    }
+    return bytes;
+}
+
+function matchUUID(chunkBytes, offset, uuidBytes) {
+    if (!uuidBytes || chunkBytes.length < offset + 16) return false;
+    for (let i = 0; i < 16; i++) {
+        if (chunkBytes[offset + i] !== uuidBytes[i]) return false;
+    }
+    return true;
+}
+
+yourUUIDBytes = uuidToBytes(yourUUID);
+
+function getSocketConnector(request) {
+    if (request && request.fetcher && typeof request.fetcher.connect === 'function') {
+        return request.fetcher;
+    }
+    return { connect };
+}
+
+const sprout = (f, h, p) => {
+    try {
+        const s = f.connect({ hostname: h, port: p });
+        if (s && s.opened && typeof s.opened.then === 'function') {
+            return s.opened.then(() => s);
+        }
+        return Promise.resolve(s);
+    } catch (e) {
+        return Promise.reject(e);
+    }
+};
+
+const raceSprout = (f, h, p, concur = 4) => {
+    if (!f || typeof f.connect !== 'function') {
+        return Promise.reject(new Error('connect unavailable'));
+    }
+    if (concur <= 1) return sprout(f, h, p);
+    const ts = Array(concur).fill(null).map(() => sprout(f, h, p));
+    return Promise.any(ts).then(winner => {
+        ts.forEach(t => {
+            t.then(s => {
+                if (s !== winner) closeSocketQuietly(s);
+            }).catch(() => {});
+        });
+        return winner;
+    });
+};
+
+const mkK = (cap, cpy = 0) => {
+    let q = [], h = 0, b = 0, buf = null;
+    const e = () => h >= q.length;
+    const trim = () => { if (h > 32 && h * 2 >= q.length) { q = q.slice(h); h = 0; } };
+    const clear = () => { q = []; h = 0; b = 0; };
+    const take = () => { if (e()) return null; const d = q[h]; q[h++] = undefined; b -= d.byteLength; trim(); return d; };
+    const sow = d => { const n = d?.byteLength || 0; return !n || (q.push(d), b += n, 1); };
+    const pack = d => {
+        d ||= take();
+        if (!d || e()) return [d, 0];
+        let n = d.byteLength, j = h;
+        while (j < q.length) {
+            const x = q[j], nn = n + x.byteLength;
+            if (nn > cap) break;
+            n = nn;
+            j++;
+        }
+        if (j === h) return [d, 0];
+        const out = buf ||= new Uint8Array(cap);
+        out.set(d);
+        for (let o = d.byteLength; h < j;) {
+            const x = q[h];
+            q[h++] = undefined;
+            b -= x.byteLength;
+            out.set(x, o);
+            o += x.byteLength;
+        }
+        trim();
+        const u = out.subarray(0, n);
+        return [cpy ? u.slice() : u, 1];
+    };
+    return { e, get b() { return b; }, clear, take, sow, pack };
+};
+
+const mkQ = cap => {
+    const k = mkK(cap);
+    return { get empty() { return k.e(); }, clear: k.clear, sow: k.sow, bundle: d => k.pack(d) };
+};
+
+const mkDn = (w, sendFn) => {
+    const cap = GRAIN_CFG.dnPack;
+    const tail = GRAIN_CFG.dnTail;
+    const low = Math.max(4096, tail * 12);
+    const k = mkK(cap, 1);
+    let tp = 0, gen = 0, qk = 0, qr = 0;
+    
+    const reap = () => {
+        if (tp) clearTimeout(tp);
+        tp = 0;
+        qr = 0;
+        for (;;) {
+            const [u] = k.pack();
+            if (!u) break;
+            sendFn(u);
+        }
+    };
+    
+    const ripen = () => {
+        if (k.e() || tp) return;
+        if (k.b >= cap || (cap - k.b) < tail) return reap();
+        tp = setTimeout(() => {
+            tp = 0;
+            if (k.e()) return;
+            if (k.b >= cap || (cap - k.b) < tail) return reap();
+            if (qr < GRAIN_CFG.dnQr && (gen !== qk || k.b < low)) {
+                qr++;
+                qk = gen;
+                return ripen();
+            }
+            reap();
+        }, 1);
+    };
+    
+    return {
+        send(u) {
+            let o = 0, n = u?.byteLength || 0;
+            if (!n) return;
+            while (o < n) {
+                const m = Math.min(cap - k.b, n - o);
+                if (!m) { reap(); continue; }
+                k.sow(o || m !== n ? u.subarray(o, o + m) : u);
+                gen++;
+                o += m;
+                if (k.b >= cap || (cap - k.b) < tail) reap();
+                else ripen();
+            }
+        },
+        reap
+    };
+};
 
 function formatIdentifier(arr, offset = 0) {
     const hex = [...arr.slice(offset, offset + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
@@ -382,6 +548,7 @@ export default {
             const hasKV = !!kv;
 
             yourUUID = config.yourUUID;
+            yourUUIDBytes = uuidToBytes(config.yourUUID);
             password = config.password;
             subPath = config.subPath;
             proxyIP = config.proxyIP;
@@ -671,7 +838,7 @@ export default {
 async function handleVlsRequest(request, customProxyIP, validSSPath) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
-    serverSock.accept();
+    serverSock.accept({ allowHalfOpen: true });
     serverSock.binaryType = 'arraybuffer';
     let remoteConnWrapper = { socket: null };
     let isDnsQuery = false;
@@ -683,16 +850,39 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
     const pathname = url.pathname;
     const isSSPath = validSSPath && pathname.toLowerCase().startsWith(validSSPath.toLowerCase());
 
+    const upQueue = mkQ(GRAIN_CFG.upPack);
+    let isWriting = false;
+
+    async function flushUpstream() {
+        if (isWriting || !remoteConnWrapper.socket) return;
+        isWriting = true;
+        try {
+            while (!upQueue.empty && remoteConnWrapper.socket) {
+                const [bundle] = upQueue.bundle();
+                if (!bundle) break;
+                const writer = remoteConnWrapper.socket.writable.getWriter();
+                try {
+                    await writer.write(bundle);
+                } finally {
+                    writer.releaseLock();
+                }
+            }
+        } catch (e) {
+            closeSocketQuietly(serverSock);
+        } finally {
+            isWriting = false;
+            if (!upQueue.empty && remoteConnWrapper.socket) {
+                flushUpstream();
+            }
+        }
+    }
+
     readable.pipeTo(new WritableStream({
         async write(chunk) {
             if (isDnsQuery) return await forwardataudp(chunk, serverSock, null);
             if (remoteConnWrapper.socket) {
-                const writer = remoteConnWrapper.socket.writable.getWriter();
-                try {
-                    await writer.write(chunk);
-                } finally {
-                    writer.releaseLock();
-                }
+                upQueue.sow(chunk);
+                await flushUpstream();
                 return;
             }
             
@@ -707,13 +897,14 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
                         throw new Error('Speedtest site is blocked');
                     }
                     
-                    await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, customProxyIP);
+                    await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, customProxyIP, request);
+                    if (remoteConnWrapper.socket && !upQueue.empty) await flushUpstream();
                     return;
                 }
             }
             
             // 2. 尝试 VLESS 协议解析
-            const vlsResult = parseVLsPacketHeader(chunk, yourUUID);
+            const vlsResult = parseVLsPacketHeader(chunk, yourUUID, yourUUIDBytes);
             if (!vlsResult.hasError) {
                 const { addressType, port, hostname, rawIndex, version, isUDP } = vlsResult;
 
@@ -728,7 +919,8 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
                 const respHeader = new Uint8Array([version[0], 0]);
                 const rawData = chunk.slice(rawIndex);
                 if (isDnsQuery) return forwardataudp(rawData, serverSock, respHeader);
-                await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, customProxyIP);
+                await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, customProxyIP, request);
+                if (remoteConnWrapper.socket && !upQueue.empty) await flushUpstream();
                 return;
             }
 
@@ -748,7 +940,8 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
                     }
                     const rawData = chunk.slice(rawIndex);
                     if (isDnsQuery) return forwardataudp(rawData, serverSock, null);
-                    await forwardataTCP(hostname, port, rawData, serverSock, null, remoteConnWrapper, customProxyIP);
+                    await forwardataTCP(hostname, port, rawData, serverSock, null, remoteConnWrapper, customProxyIP, request);
+                    if (remoteConnWrapper.socket && !upQueue.empty) await flushUpstream();
                     return;
                 }
             }
@@ -759,7 +952,11 @@ async function handleVlsRequest(request, customProxyIP, validSSPath) {
         // console.error('Readable pipe error:', err);
     });
 
-    return new Response(null, { status: 101, webSocket: clientSock });
+    return new Response(null, { 
+        status: 101, 
+        webSocket: clientSock,
+        headers: { 'Sec-WebSocket-Extensions': '' }
+    });
 }
 
 async function parsetroHeader(buffer, passwordPlainText) {
@@ -1586,13 +1783,19 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
     }
 }
 
-async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, customProxyIP) {
-    async function connectDirect(address, port, data) {
-        const remoteSock = connect({ hostname: address, port: port });
-        const writer = remoteSock.writable.getWriter();
-        await writer.write(data);
-        writer.releaseLock();
-        return remoteSock;
+async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, customProxyIP, request) {
+    async function connectDirect(address, port, data, concur = GRAIN_CFG.concur) {
+        const connector = getSocketConnector(request);
+        const sock = await raceSprout(connector, address, port, concur);
+        if (data && data.byteLength > 0) {
+            const writer = sock.writable.getWriter();
+            try {
+                await writer.write(data);
+            } finally {
+                writer.releaseLock();
+            }
+        }
+        return sock;
     }
     
     let proxyConfig = null;
@@ -1622,7 +1825,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         } else if (proxyConfig.type === 'turn') {
             newSocket = await connect2Turn(proxyConfig, host, portNum, rawData);
         } else {
-            newSocket = await connectDirect(proxyConfig.host, proxyConfig.port, rawData);
+            newSocket = await connectDirect(proxyConfig.host, proxyConfig.port, rawData, 1);
         }
         
         remoteConnWrapper.socket = newSocket;
@@ -1638,7 +1841,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         }
     } else {
         try {
-            const initialSocket = await connectDirect(host, portNum, rawData);
+            const initialSocket = await connectDirect(host, portNum, rawData, GRAIN_CFG.concur);
             remoteConnWrapper.socket = initialSocket;
             connectStreams(initialSocket, ws, respHeader, connecttoPry);
         } catch (err) {
@@ -1648,25 +1851,30 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
     }
 }
 
-function parseVLsPacketHeader(chunk, token) {
+function parseVLsPacketHeader(chunk, token, tokenBytes) {
     if (chunk.byteLength < 24) return { hasError: true, message: 'Invalid data' };
     const version = new Uint8Array(chunk.slice(0, 1));
-    if (formatIdentifier(new Uint8Array(chunk.slice(1, 17))) !== token) return { hasError: true, message: 'Invalid uuid' };
-    const optLen = new Uint8Array(chunk.slice(17, 18))[0];
-    const cmd = new Uint8Array(chunk.slice(18 + optLen, 19 + optLen))[0];
+    const chunkView = new Uint8Array(chunk);
+    if (tokenBytes) {
+        if (!matchUUID(chunkView, 1, tokenBytes)) return { hasError: true, message: 'Invalid uuid' };
+    } else {
+        if (formatIdentifier(chunkView.slice(1, 17)) !== token) return { hasError: true, message: 'Invalid uuid' };
+    }
+    const optLen = chunkView[17];
+    const cmd = chunkView[18 + optLen];
     let isUDP = false;
     if (cmd === 1) {} else if (cmd === 2) { isUDP = true; } else { return { hasError: true, message: 'Invalid command' }; }
     const portIdx = 19 + optLen;
     const port = new DataView(chunk.slice(portIdx, portIdx + 2)).getUint16(0);
     let addrIdx = portIdx + 2, addrLen = 0, addrValIdx = addrIdx + 1, hostname = '';
-    const addressType = new Uint8Array(chunk.slice(addrIdx, addrValIdx))[0];
+    const addressType = chunkView[addrIdx];
     switch (addressType) {
         case 1: 
             addrLen = 4; 
             hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.'); 
             break;
         case 2: 
-            addrLen = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + 1))[0]; 
+            addrLen = chunkView[addrValIdx]; 
             addrValIdx += 1; 
             hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
             break;
@@ -1758,28 +1966,76 @@ function makeReadableStr(socket, earlyDataHeader) {
 
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
     let header = headerData, hasData = false;
-    await remoteSocket.readable.pipeTo(
-        new WritableStream({
-            async write(chunk) {
-                hasData = true;
-                if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-                    throw new Error('ws.readyState is not open');
-                }
-                if (header) { 
-                    const response = new Uint8Array(header.length + chunk.byteLength);
-                    response.set(header, 0);
-                    response.set(chunk, header.length);
-                    webSocket.send(response.buffer); 
-                    header = null; 
-                } else { 
-                    webSocket.send(chunk); 
-                }
-            },
-            abort() {},
-        })
-    ).catch((err) => { 
-        closeSocketQuietly(webSocket); 
-    });
+
+    function sendChunk(data) {
+        hasData = true;
+        if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            throw new Error('ws.readyState is not open');
+        }
+        if (header) {
+            const combined = new Uint8Array(header.length + data.byteLength);
+            combined.set(header, 0);
+            combined.set(data, header.length);
+            webSocket.send(combined.buffer);
+            header = null;
+        } else {
+            webSocket.send(data);
+        }
+    }
+
+    const tx = mkDn(webSocket, sendChunk);
+    const rd = remoteSocket?.readable;
+    if (!rd) {
+        closeSocketQuietly(webSocket);
+        if (!hasData && retryFunc) await retryFunc();
+        return;
+    }
+
+    let r = null;
+    let isByob = true;
+    try {
+        r = rd.getReader({ mode: 'byob' });
+    } catch (e) {
+        isByob = false;
+        r = rd.getReader();
+    }
+
+    let buf = isByob ? new ArrayBuffer(GRAIN_CFG.chunk) : null;
+    try {
+        for (;;) {
+            if (webSocket.readyState !== WS_READY_STATE_OPEN) break;
+            let done, v;
+            if (isByob) {
+                const res = await r.read(new Uint8Array(buf, 0, GRAIN_CFG.chunk));
+                done = res.done;
+                v = res.value;
+            } else {
+                const res = await r.read();
+                done = res.done;
+                v = res.value;
+            }
+            if (done) break;
+            if (!v?.byteLength) continue;
+
+            // 大包 (>= 32KB): 直发并换新 Buffer
+            if (v.byteLength >= (GRAIN_CFG.chunk >> 1)) {
+                tx.reap();
+                sendChunk(v);
+                if (isByob) buf = new ArrayBuffer(GRAIN_CFG.chunk);
+            } else {
+                // 小包 (< 32KB): 聚合发出
+                tx.send(v.slice());
+                if (isByob) buf = v.buffer;
+            }
+        }
+        tx.reap();
+    } catch (err) {
+        closeSocketQuietly(webSocket);
+    } finally {
+        try { tx.reap(); } catch (e) {}
+        try { r?.releaseLock(); } catch (e) {}
+    }
+
     if (!hasData && retryFunc) {
         await retryFunc();
     }
