@@ -711,13 +711,24 @@ export default {
 
             // 4. WebSocket 连接
             if (request.headers.get('Upgrade') === 'websocket') {
-                const customProxyIP = pathProxyIP || 
+                let customProxyIP = pathProxyIP || 
                     url.searchParams.get('fd') || 
                     url.searchParams.get('ld') || 
                     url.searchParams.get('proxyip') || 
                     request.headers.get('fd') || 
                     request.headers.get('ld') || 
                     request.headers.get('proxyip');
+
+                // 若 customProxyIP 为数字索引 (如 ld=0, ld=1)，自动从 proxyIPs 列表中按索引映射出实际出站代理
+                if (customProxyIP && /^\d+$/.test(customProxyIP.trim())) {
+                    const idx = parseInt(customProxyIP.trim(), 10);
+                    const list = (Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0) ? config.proxyIPs : (config.proxyIP ? [config.proxyIP] : []);
+                    if (list[idx]) {
+                        let raw = list[idx].trim();
+                        if (raw.includes('#')) raw = raw.split('#')[0].trim();
+                        customProxyIP = raw.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+                    }
+                }
                 return await handleVlsRequest(request, customProxyIP, validSSPath);
             } else if (request.method === 'GET') {
                 // 5. 后台管理页面 (/admin - 需 ADMIN 密码验证)
@@ -756,13 +767,15 @@ export default {
                         const cleanAddr = rawItem.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
                         return {
                             proxyAddr: cleanAddr,
-                            proxyTag: proxyTag || (rawProxyList.length > 1 ? `落地${idx + 1}` : ''),
-                            isDefaultOnly: rawProxyList.length <= 1 && !proxyTag
+                            proxyTag: proxyTag,
+                            index: idx,
+                            hasRemark: !!proxyTag
                         };
                     }).filter(p => p.proxyAddr);
 
                     // 若未配置落地代理，默认保留单路全局/默认出站
-                    const effectiveProxies = parsedProxies.length > 0 ? parsedProxies : [{ proxyAddr: '', proxyTag: '', isDefaultOnly: true }];
+                    const effectiveProxies = parsedProxies.length > 0 ? parsedProxies : [{ proxyAddr: '', proxyTag: '', index: 0, hasRemark: false }];
+                    const needIndexRouting = parsedProxies.length > 1 || (parsedProxies.length === 1 && parsedProxies[0].hasRemark);
 
                     // 生成 VLESS 节点 (优选 CDN × 落地代理)
                     const vlsLinks = [];
@@ -787,11 +800,11 @@ export default {
                             host = cdnItemClean;
                         }
 
-                        const baseName = nodeName ? `${nodeName}-${vlsHeader}` : `Workers-${vlsHeader}`;
                         for (const proxy of effectiveProxies) {
-                            const vlsNodeName = proxy.proxyTag ? `${baseName}-${proxy.proxyTag}` : baseName;
-                            const wsPath = proxy.proxyAddr && !proxy.isDefaultOnly
-                                ? `/?ed=2560&ld=${encodeURIComponent(proxy.proxyAddr)}`
+                            // 规则：有落地且有备注 => 【协议名】-【落地备注】；无落地或无备注 => 【CDN备注】-【协议名】
+                            const vlsNodeName = proxy.hasRemark ? `VLESS-${proxy.proxyTag}` : (nodeName ? `${nodeName}-VLESS` : 'Workers-VLESS');
+                            const wsPath = (proxy.proxyAddr && needIndexRouting)
+                                ? `/?ed=2560&ld=${proxy.index}`
                                 : '/?ed=2560';
                             vlsLinks.push(`${vlsHeader}://${config.yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${vlsNodeName}`);
                         }
@@ -821,11 +834,10 @@ export default {
                                 host = cdnItemClean;
                             }
 
-                            const baseName = nodeName ? `${nodeName}-${troHeader}` : `Workers-${troHeader}`;
                             for (const proxy of effectiveProxies) {
-                                const troNodeName = proxy.proxyTag ? `${baseName}-${proxy.proxyTag}` : baseName;
-                                const wsPath = proxy.proxyAddr && !proxy.isDefaultOnly
-                                    ? `/?ed=2560&ld=${encodeURIComponent(proxy.proxyAddr)}`
+                                const troNodeName = proxy.hasRemark ? `Trojan-${proxy.proxyTag}` : (nodeName ? `${nodeName}-Trojan` : 'Workers-Trojan');
+                                const wsPath = (proxy.proxyAddr && needIndexRouting)
+                                    ? `/?ed=2560&ld=${proxy.index}`
                                     : '/?ed=2560';
                                 troLinks.push(`${troHeader}://${config.yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${troNodeName}`);
                             }
@@ -859,11 +871,10 @@ export default {
                                 host = cdnItemClean;
                             }
 
-                            const baseName = nodeName ? `${nodeName}-${ssHeader}` : `Workers-${ssHeader}`;
                             for (const proxy of effectiveProxies) {
-                                const ssNodeName = proxy.proxyTag ? `${baseName}-${proxy.proxyTag}` : baseName;
-                                const ssWsPath = proxy.proxyAddr && !proxy.isDefaultOnly
-                                    ? `${validSSPath}/?ed=2560&ld=${encodeURIComponent(proxy.proxyAddr)}`
+                                const ssNodeName = proxy.hasRemark ? `SS-${proxy.proxyTag}` : (nodeName ? `${nodeName}-SS` : 'Workers-SS');
+                                const ssWsPath = (proxy.proxyAddr && needIndexRouting)
+                                    ? `${validSSPath}/?ed=2560&ld=${proxy.index}`
                                     : `${validSSPath}/?ed=2560`;
                                 ssLinks.push(`${ssHeader}://${encodedConfig}@${host}:${port}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${encodeURIComponent(ssWsPath)};tls;sni%3D${currentDomain};skip-cert-verify%3Dtrue;mux%3D0#${ssNodeName}`);
                             }
@@ -1869,6 +1880,15 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
     let proxyConfig = null;
     let shouldUseProxy = false;
     if (customProxyIP) {
+        if (/^\d+$/.test(customProxyIP.trim())) {
+            const idx = parseInt(customProxyIP.trim(), 10);
+            const list = (Array.isArray(proxyIPs) && proxyIPs.length > 0) ? proxyIPs : (proxyIP ? [proxyIP] : []);
+            if (list[idx]) {
+                let raw = list[idx].trim();
+                if (raw.includes('#')) raw = raw.split('#')[0].trim();
+                customProxyIP = raw.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+            }
+        }
         proxyConfig = parsePryAddress(customProxyIP);
         if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn')) {
             shouldUseProxy = true;
