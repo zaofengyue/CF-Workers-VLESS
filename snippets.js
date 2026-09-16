@@ -3,6 +3,7 @@ import { connect } from 'cloudflare:sockets';
 // 默认配置（支持环境变量动态覆盖）
 let proxyIP = 'proxy.xxxxxxxx.tk:50001';
 let yourUUID = '93bf61d9-3796-44c2-9b3a-49210ece2585';
+let subPath = ''; // 节点订阅路径，不修改则使用UUID作为订阅路径
 
 // 优选节点列表 (格式: 域名/IP[:端口][#备注])
 let cfip = [
@@ -11,13 +12,14 @@ let cfip = [
 ];
 
 function getHomePageHTML(domain) {
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Snippets VLESS</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(135deg,#4f46e5,#06b6d4);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#1f2937}.card{background:#fff;padding:32px;border-radius:16px;box-shadow:0 20px 40px rgba(0,0,0,.15);max-width:480px;width:100%;text-align:center}h1{color:#4f46e5;font-size:1.6rem;margin-bottom:12px}.desc{color:#6b7280;font-size:.95rem;line-height:1.6;margin-bottom:24px}.btn{display:inline-block;background:#4f46e5;color:#fff;padding:10px 24px;border-radius:8px;text-decoration:none;font-weight:500;transition:.2s}.btn:hover{background:#4338ca}.footer{margin-top:24px;padding-top:16px;border-top:1px solid #f3f4f6;font-size:.8rem;color:#9ca3af}.footer a{color:#4f46e5;text-decoration:none;margin:0 8px}</style></head><body><div class="card"><h1>⚡ Hello Snippets</h1><p class="desc">VLESS over WebSocket 代理服务已就绪。<br>请访问订阅路径获取节点配置：<br><strong style="color:#111827;word-break:break-all">https://${domain}/${yourUUID}</strong></p><a class="btn" href="/${yourUUID}">查看订阅中心</a><div class="footer"><a href="https://github.com/zaofengyue/CF-Workers-VLESS" target="_blank">GitHub</a>|<a href="https://proxy.fengyue.bond" target="_blank">ProxyIP检测</a>|<a href="https://socks.fengyue.bond" target="_blank">Socks5检测</a></div></div></body></html>`;
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Snippets VLESS</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(135deg,#4f46e5,#06b6d4);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#1f2937}.card{background:#fff;padding:32px;border-radius:16px;box-shadow:0 20px 40px rgba(0,0,0,.15);max-width:480px;width:100%;text-align:center}h1{color:#4f46e5;font-size:1.6rem;margin-bottom:12px}.desc{color:#6b7280;font-size:.95rem;line-height:1.6;margin-bottom:24px}.footer{margin-top:24px;padding-top:16px;border-top:1px solid #f3f4f6;font-size:.8rem;color:#9ca3af}.footer a{color:#4f46e5;text-decoration:none;margin:0 8px}</style></head><body><div class="card"><h1>⚡ Hello Snippets</h1><p class="desc">VLESS over WebSocket 代理服务已就绪。<br>请访问订阅路径获取节点配置：<br><strong style="color:#111827">https://${domain}/你的UUID</strong></p><div class="footer"><a href="https://github.com/zaofengyue/CF-Workers-VLESS" target="_blank">GitHub</a>|<a href="https://proxy.fengyue.bond" target="_blank">ProxyIP检测</a>|<a href="https://socks.fengyue.bond" target="_blank">Socks5检测</a></div></div></body></html>`;
 }
 
-function getSubPageHTML(domain) {
-    const v2raySub = `https://${domain}/sub/${yourUUID}`;
-    const clashSub = `https://sublink.alwaysdata.net/clash?config=https://${domain}/sub/${yourUUID}`;
-    const singboxSub = `https://sublink.alwaysdata.net/singbox?config=https://${domain}/sub/${yourUUID}`;
+function getSubPageHTML(domain, subToken) {
+    const sub = subToken || yourUUID;
+    const v2raySub = `https://${domain}/sub/${sub}`;
+    const clashSub = `https://sublink.alwaysdata.net/clash?config=https://${domain}/sub/${sub}`;
+    const singboxSub = `https://sublink.alwaysdata.net/singbox?config=https://${domain}/sub/${sub}`;
     return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Snippets 订阅中心</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,sans-serif;background:#f3f4f6;color:#1f2937;padding:20px;line-height:1.5}.wrap{max-width:760px;margin:0 auto;background:#fff;border-radius:14px;padding:24px;box-shadow:0 4px 20px rgba(0,0,0,.06)}h1{color:#4f46e5;font-size:1.5rem;margin-bottom:20px;text-align:center}.box{background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:14px;margin-bottom:14px}.label{font-size:.85rem;font-weight:600;color:#4b5563;margin-bottom:6px}.row{display:flex;gap:8px}.text{flex:1;background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.btn{background:#4f46e5;color:#fff;border:none;border-radius:6px;padding:0 14px;font-size:.8rem;cursor:pointer;flex-shrink:0;transition:.2s}.btn:hover{background:#4338ca}.btn.copied{background:#10b981}.guide{background:#fffbeb;border:1px solid #fef3c7;border-radius:10px;padding:14px;margin-top:20px;font-size:.82rem}.guide h3{color:#b45309;margin-bottom:8px;font-size:.95rem}.guide code{background:#fff;padding:2px 5px;border-radius:4px;border:1px solid #fde68a;color:#d97706;font-family:monospace;word-break:break-all}.footer{text-align:center;margin-top:20px;padding-top:14px;border-top:1px solid #f3f4f6;font-size:.78rem;color:#9ca3af}.footer a{color:#4f46e5;text-decoration:none;margin:0 6px}</style></head><body><div class="wrap"><h1>⚡ Snippets 订阅中心</h1><div class="box"><div class="label">v2rayN / Loon / Shadowrocket / Karing</div><div class="row"><div class="text" id="l1">${v2raySub}</div><button class="btn" onclick="cp('l1',this)">复制</button></div></div><div class="box"><div class="label">Clash (Mihomo / FlClash / Meta)</div><div class="row"><div class="text" id="l2">${clashSub}</div><button class="btn" onclick="cp('l2',this)">复制</button></div></div><div class="box"><div class="label">Sing-box (SFI / SFA)</div><div class="row"><div class="text" id="l3">${singboxSub}</div><button class="btn" onclick="cp('l3',this)">复制</button></div></div><div class="guide"><h3>⚙️ 节点路径参数 (Path) 说明</h3><p>• 默认路径: <code>/?ed=2560</code> (使用内置 ProxyIP)</p><p style="margin-top:4px">• 指定分流 ProxyIP: <code>/?ed=2560&fd=域名或IP:端口</code> 或 <code>/fd=域名或IP:端口</code></p><p style="margin-top:4px">• 指定 SOCKS5 落地: <code>/?ed=2560&ld=socks5://user:pass@host:port</code></p><p style="margin-top:4px">• 指定 HTTP/HTTPS 落地: <code>/?ed=2560&ld=http://user:pass@host:port</code></p></div><div class="footer"><a href="https://github.com/zaofengyue/CF-Workers-VLESS" target="_blank">GitHub 仓库</a>|<a href="https://proxy.fengyue.bond" target="_blank">ProxyIP检测</a>|<a href="https://socks.fengyue.bond" target="_blank">Socks5检测</a></div></div><script>function cp(id,b){const t=document.getElementById(id).textContent;navigator.clipboard.writeText(t).then(()=>{const o=b.textContent;b.textContent='已复制';b.classList.add('copied');setTimeout(()=>{b.textContent=o;b.classList.remove('copied')},2e3)})}</script></body></html>`;
 }
 
@@ -82,7 +84,9 @@ export default {
             if (env) {
                 yourUUID = env.UUID || env.uuid || yourUUID;
                 proxyIP = env.PROXYIP || env.proxyip || proxyIP;
+                subPath = env.SUB_PATH || env.subpath || subPath;
             }
+            const effectiveSub = subPath || yourUUID;
             const url = new URL(request.url);
             const pathname = url.pathname;
             let pathProxyIP = null;
@@ -107,8 +111,11 @@ export default {
 
             if (request.method === 'GET') {
                 if (pathname === '/') return new Response(getHomePageHTML(url.hostname), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-                if (pathname === `/${yourUUID}`) return new Response(getSubPageHTML(url.hostname), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-                if (pathname.toLowerCase().includes(`/sub/${yourUUID}`)) {
+                const pathLower = pathname.toLowerCase();
+                if (pathLower === `/${yourUUID.toLowerCase()}` || (subPath && pathLower === `/${subPath.toLowerCase()}`)) {
+                    return new Response(getSubPageHTML(url.hostname, effectiveSub), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+                }
+                if (pathLower.includes(`/sub/${effectiveSub.toLowerCase()}`) || pathLower.includes(`/sub/${yourUUID.toLowerCase()}`)) {
                     const hostDomain = url.hostname;
                     const links = cfip.map(item => {
                         let host, port = 443, name = '';
