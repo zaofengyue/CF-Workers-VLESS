@@ -3183,6 +3183,7 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false) {
  */
 function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
     const clashFullUrl = `${config.clashSubUrl || 'https://sublink.alwaysdata.net/clash?config='}${baseUrl}/${config.subPath}`;
+    const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.alwaysdata.net/singbox?config='}${baseUrl}/${config.subPath}`;
     const ssMethod = config.ssMethod || 'aes-256-gcm';
     const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${config.yourUUID},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
 
@@ -3651,6 +3652,7 @@ function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
  */
 function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
     const clashFullUrl = `${config.clashSubUrl || 'https://sublink.alwaysdata.net/clash?config='}${baseUrl}/${config.subPath}`;
+    const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.alwaysdata.net/singbox?config='}${baseUrl}/${config.subPath}`;
     const ssMethod = config.ssMethod || 'aes-256-gcm';
     const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${config.yourUUID},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
 
