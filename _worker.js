@@ -14,6 +14,7 @@ const DEFAULT_CONFIG = {
     password: '123456',
     adminPassword: 'admin',
     proxyIP: 'proxy.xxxxxxxx.tk:50001',
+    proxyIPs: ['proxy.xxxxxxxx.tk:50001'],
     yourUUID: '5dc15e15-f285-4a9d-959b-0e4fbdd77b63',
     disabletro: false,
     disabless: false,
@@ -30,6 +31,7 @@ let subPath = DEFAULT_CONFIG.subPath;
 let password = DEFAULT_CONFIG.password;
 let adminPassword = DEFAULT_CONFIG.adminPassword;
 let proxyIP = DEFAULT_CONFIG.proxyIP;
+let proxyIPs = [...DEFAULT_CONFIG.proxyIPs];
 let yourUUID = DEFAULT_CONFIG.yourUUID;
 let yourUUIDBytes = null;
 let disabletro = DEFAULT_CONFIG.disabletro;
@@ -52,7 +54,7 @@ async function loadConfig(env) {
         return memoryConfigCache;
     }
 
-    let config = { ...DEFAULT_CONFIG, cfip: [...DEFAULT_CONFIG.cfip] };
+    let config = { ...DEFAULT_CONFIG, cfip: [...DEFAULT_CONFIG.cfip], proxyIPs: [...DEFAULT_CONFIG.proxyIPs] };
 
     // 1. 环境变量覆盖
     if (env) {
@@ -61,8 +63,12 @@ async function loadConfig(env) {
         if (env.ADMIN || env.admin) config.adminPassword = env.ADMIN || env.admin;
         if (env.SUB_PATH || env.subpath) config.subPath = env.SUB_PATH || env.subpath;
         if (env.PROXYIP || env.proxyip || env.proxyIP) {
-            const servers = (env.PROXYIP || env.proxyip || env.proxyIP).split(',').map(s => s.trim());
-            config.proxyIP = servers[0];
+            const rawProxy = env.PROXYIP || env.proxyip || env.proxyIP;
+            const servers = String(rawProxy).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
+            if (servers.length > 0) {
+                config.proxyIPs = servers;
+                config.proxyIP = servers[0];
+            }
         }
         if (env.DISABLE_TROJAN !== undefined || env.CLOSE_TROJAN !== undefined) {
             const dt = env.DISABLE_TROJAN || env.CLOSE_TROJAN;
@@ -88,7 +94,14 @@ async function loadConfig(env) {
                 if (kvData.adminPassword) config.adminPassword = String(kvData.adminPassword).trim();
                 else if (kvData.ADMIN) config.adminPassword = String(kvData.ADMIN).trim();
                 if (kvData.subPath !== undefined && kvData.subPath !== null) config.subPath = String(kvData.subPath).trim();
-                if (kvData.proxyIP) config.proxyIP = String(kvData.proxyIP).trim();
+                if (Array.isArray(kvData.proxyIPs) && kvData.proxyIPs.length > 0) {
+                    config.proxyIPs = kvData.proxyIPs.map(s => String(s).trim()).filter(Boolean);
+                    config.proxyIP = config.proxyIPs[0] || '';
+                } else if (kvData.proxyIP) {
+                    const servers = String(kvData.proxyIP).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
+                    config.proxyIPs = servers.length > 0 ? servers : [String(kvData.proxyIP).trim()];
+                    config.proxyIP = config.proxyIPs[0] || String(kvData.proxyIP).trim();
+                }
                 if (Array.isArray(kvData.cfip) && kvData.cfip.length > 0) config.cfip = kvData.cfip.map(s => String(s).trim()).filter(Boolean);
                 if (kvData.disabletro !== undefined) config.disabletro = kvData.disabletro === true || kvData.disabletro === 'true';
                 if (kvData.disabless !== undefined) config.disabless = kvData.disabless === true || kvData.disabless === 'true';
@@ -552,6 +565,7 @@ export default {
             password = config.password;
             subPath = config.subPath;
             proxyIP = config.proxyIP;
+            proxyIPs = config.proxyIPs;
             disabletro = config.disabletro;
             disabless = config.disabless;
             SSpath = config.SSpath;
@@ -590,13 +604,24 @@ export default {
                         } else if (Array.isArray(body.cfip)) {
                             newCfip = body.cfip.map(s => String(s).trim()).filter(Boolean);
                         }
+
+                        let newProxyIPs = config.proxyIPs;
+                        if (typeof body.proxyIPs === 'string') {
+                            newProxyIPs = body.proxyIPs.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
+                        } else if (Array.isArray(body.proxyIPs)) {
+                            newProxyIPs = body.proxyIPs.map(s => String(s).trim()).filter(Boolean);
+                        } else if (typeof body.proxyIP === 'string') {
+                            newProxyIPs = body.proxyIP.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
+                        }
+                        const mainProxyIP = newProxyIPs.length > 0 ? newProxyIPs[0] : (body.proxyIP ? String(body.proxyIP).trim() : config.proxyIP);
                         
                         const updatedConfig = {
                             yourUUID: (body.yourUUID && String(body.yourUUID).trim()) || config.yourUUID,
                             password: (body.password && String(body.password).trim()) || config.password,
                             adminPassword: (body.adminPassword && String(body.adminPassword).trim()) || config.adminPassword,
                             subPath: body.subPath !== undefined ? String(body.subPath).trim() : config.subPath,
-                            proxyIP: (body.proxyIP && String(body.proxyIP).trim()) || config.proxyIP,
+                            proxyIP: mainProxyIP,
+                            proxyIPs: newProxyIPs.length > 0 ? newProxyIPs : [mainProxyIP],
                             disabletro: body.disabletro === true || body.disabletro === 'true',
                             disabless: body.disabless === true || body.disabless === 'true',
                             SSpath: body.SSpath !== undefined ? String(body.SSpath).trim() : config.SSpath,
@@ -715,91 +740,134 @@ export default {
                     // 解析优选节点 (支持本地列表与远程 Gist / URL 订阅自动拉取合并)
                     const resolvedCfip = await resolveCfipList(config.cfip);
 
-                    // 生成 VLESS 节点
-                    const vlsLinks = resolvedCfip.map(cdnItem => {
-                        let host, port = 443, nodeName = '';
+                    // 解析多落地代理列表 (支持 #备注名，如 socks5://...@1.2.3.4:1080#香港S5)
+                    const rawProxyList = (Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0)
+                        ? config.proxyIPs
+                        : (config.proxyIP ? [config.proxyIP] : []);
+
+                    const parsedProxies = rawProxyList.map((item, idx) => {
+                        let rawItem = String(item).trim();
+                        let proxyTag = '';
+                        if (rawItem.includes('#')) {
+                            const parts = rawItem.split('#');
+                            rawItem = parts[0].trim();
+                            proxyTag = parts[1].trim();
+                        }
+                        const cleanAddr = rawItem.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+                        return {
+                            proxyAddr: cleanAddr,
+                            proxyTag: proxyTag || (rawProxyList.length > 1 ? `落地${idx + 1}` : ''),
+                            isDefaultOnly: rawProxyList.length <= 1 && !proxyTag
+                        };
+                    }).filter(p => p.proxyAddr);
+
+                    // 若未配置落地代理，默认保留单路全局/默认出站
+                    const effectiveProxies = parsedProxies.length > 0 ? parsedProxies : [{ proxyAddr: '', proxyTag: '', isDefaultOnly: true }];
+
+                    // 生成 VLESS 节点 (优选 CDN × 落地代理)
+                    const vlsLinks = [];
+                    for (const cdnItem of resolvedCfip) {
+                        let host, port = 443, nodeName = '', cdnItemClean = cdnItem;
                         if (cdnItem.includes('#')) {
                             const parts = cdnItem.split('#');
-                            cdnItem = parts[0];
+                            cdnItemClean = parts[0];
                             nodeName = parts[1];
                         }
 
-                        if (cdnItem.startsWith('[') && cdnItem.includes(']:')) {
-                            const ipv6End = cdnItem.indexOf(']:');
-                            host = cdnItem.substring(0, ipv6End + 1); 
-                            const portStr = cdnItem.substring(ipv6End + 2); 
+                        if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
+                            const ipv6End = cdnItemClean.indexOf(']:');
+                            host = cdnItemClean.substring(0, ipv6End + 1); 
+                            const portStr = cdnItemClean.substring(ipv6End + 2); 
                             port = parseInt(portStr) || 443;
-                        } else if (cdnItem.includes(':')) {
-                            const parts = cdnItem.split(':');
+                        } else if (cdnItemClean.includes(':')) {
+                            const parts = cdnItemClean.split(':');
                             host = parts[0];
                             port = parseInt(parts[1]) || 443;
                         } else {
-                            host = cdnItem;
+                            host = cdnItemClean;
                         }
-                        
-                        const vlsNodeName = nodeName ? `${nodeName}-${vlsHeader}` : `Workers-${vlsHeader}`;
-                        return `${vlsHeader}://${config.yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${vlsNodeName}`;
-                    });
+
+                        const baseName = nodeName ? `${nodeName}-${vlsHeader}` : `Workers-${vlsHeader}`;
+                        for (const proxy of effectiveProxies) {
+                            const vlsNodeName = proxy.proxyTag ? `${baseName}-${proxy.proxyTag}` : baseName;
+                            const wsPath = proxy.proxyAddr && !proxy.isDefaultOnly
+                                ? `/?ed=2560&ld=${encodeURIComponent(proxy.proxyAddr)}`
+                                : '/?ed=2560';
+                            vlsLinks.push(`${vlsHeader}://${config.yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${vlsNodeName}`);
+                        }
+                    }
                     
-                    // 生成 Trojan 节点
+                    // 生成 Trojan 节点 (优选 CDN × 落地代理)
                     let troLinks = [];
                     if (!config.disabletro) {
-                        troLinks = resolvedCfip.map(cdnItem => {
-                            let host, port = 443, nodeName = '';
+                        for (const cdnItem of resolvedCfip) {
+                            let host, port = 443, nodeName = '', cdnItemClean = cdnItem;
                             if (cdnItem.includes('#')) {
                                 const parts = cdnItem.split('#');
-                                cdnItem = parts[0];
+                                cdnItemClean = parts[0];
                                 nodeName = parts[1];
                             }
 
-                            if (cdnItem.startsWith('[') && cdnItem.includes(']:')) {
-                                const ipv6End = cdnItem.indexOf(']:');
-                                host = cdnItem.substring(0, ipv6End + 1); 
-                                const portStr = cdnItem.substring(ipv6End + 2); 
+                            if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
+                                const ipv6End = cdnItemClean.indexOf(']:');
+                                host = cdnItemClean.substring(0, ipv6End + 1); 
+                                const portStr = cdnItemClean.substring(ipv6End + 2); 
                                 port = parseInt(portStr) || 443;
-                            } else if (cdnItem.includes(':')) {
-                                const parts = cdnItem.split(':');
+                            } else if (cdnItemClean.includes(':')) {
+                                const parts = cdnItemClean.split(':');
                                 host = parts[0];
                                 port = parseInt(parts[1]) || 443;
                             } else {
-                                host = cdnItem;
+                                host = cdnItemClean;
                             }
-                            
-                            const troNodeName = nodeName ? `${nodeName}-${troHeader}` : `Workers-${troHeader}`;
-                            return `${troHeader}://${config.yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${troNodeName}`;
-                        });
+
+                            const baseName = nodeName ? `${nodeName}-${troHeader}` : `Workers-${troHeader}`;
+                            for (const proxy of effectiveProxies) {
+                                const troNodeName = proxy.proxyTag ? `${baseName}-${proxy.proxyTag}` : baseName;
+                                const wsPath = proxy.proxyAddr && !proxy.isDefaultOnly
+                                    ? `/?ed=2560&ld=${encodeURIComponent(proxy.proxyAddr)}`
+                                    : '/?ed=2560';
+                                troLinks.push(`${troHeader}://${config.yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${troNodeName}`);
+                            }
+                        }
                     }
 
-                    // 生成 Shadowsocks 节点
+                    // 生成 Shadowsocks 节点 (优选 CDN × 落地代理)
                     let ssLinks = [];
                     if (!config.disabless) {
                         const method = 'none';
                         const ssConfig = `${method}:${config.yourUUID}`;
                         const encodedConfig = btoa(ssConfig);
-                        ssLinks = resolvedCfip.map(cdnItem => {
-                            let host, port = 443, nodeName = '';
+                        for (const cdnItem of resolvedCfip) {
+                            let host, port = 443, nodeName = '', cdnItemClean = cdnItem;
                             if (cdnItem.includes('#')) {
                                 const parts = cdnItem.split('#');
-                                cdnItem = parts[0];
+                                cdnItemClean = parts[0];
                                 nodeName = parts[1];
                             }
 
-                            if (cdnItem.startsWith('[') && cdnItem.includes(']:')) {
-                                const ipv6End = cdnItem.indexOf(']:');
-                                host = cdnItem.substring(0, ipv6End + 1); 
-                                const portStr = cdnItem.substring(ipv6End + 2); 
+                            if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
+                                const ipv6End = cdnItemClean.indexOf(']:');
+                                host = cdnItemClean.substring(0, ipv6End + 1); 
+                                const portStr = cdnItemClean.substring(ipv6End + 2); 
                                 port = parseInt(portStr) || 443;
-                            } else if (cdnItem.includes(':')) {
-                                const parts = cdnItem.split(':');
+                            } else if (cdnItemClean.includes(':')) {
+                                const parts = cdnItemClean.split(':');
                                 host = parts[0];
                                 port = parseInt(parts[1]) || 443;
                             } else {
-                                host = cdnItem;
+                                host = cdnItemClean;
                             }
-                            
-                            const ssNodeName = nodeName ? `${nodeName}-${ssHeader}` : `Workers-${ssHeader}`;
-                            return `${ssHeader}://${encodedConfig}@${host}:${port}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${validSSPath}/?ed%3D2560;tls;sni%3D${currentDomain};skip-cert-verify%3Dtrue;mux%3D0#${ssNodeName}`;
-                        });
+
+                            const baseName = nodeName ? `${nodeName}-${ssHeader}` : `Workers-${ssHeader}`;
+                            for (const proxy of effectiveProxies) {
+                                const ssNodeName = proxy.proxyTag ? `${baseName}-${proxy.proxyTag}` : baseName;
+                                const ssWsPath = proxy.proxyAddr && !proxy.isDefaultOnly
+                                    ? `${validSSPath}/?ed=2560&ld=${encodeURIComponent(proxy.proxyAddr)}`
+                                    : `${validSSPath}/?ed=2560`;
+                                ssLinks.push(`${ssHeader}://${encodedConfig}@${host}:${port}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${encodeURIComponent(ssWsPath)};tls;sni%3D${currentDomain};skip-cert-verify%3Dtrue;mux%3D0#${ssNodeName}`);
+                            }
+                        }
                     }
 
                     let allLinks = [...vlsLinks, ...troLinks, ...ssLinks];
@@ -3428,13 +3496,13 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 </div>
             </div>
 
-            <!-- ProxyIP / 落地出站设置 -->
+            <!-- ProxyIP / 落地出站设置 (支持填写多个，每行一个) -->
             <div class="config-card">
-                <h3><i class="fas fa-server"></i> 出站代理设置 (fd= 分流代理 / ld= 落地代理)</h3>
+                <h3><i class="fas fa-server"></i> 出站落地代理设置 (支持填写多个，每行一个)</h3>
                 <div class="form-group">
-                    <label for="cfg-proxyip">出站代理服务器地址 (fd / ld / proxyip)</label>
-                    <input type="text" id="cfg-proxyip" class="form-input" value="${config.proxyIP}" placeholder="例如: socks5://user:pass@host:port 或 sstp://host:443 或 turn://user:pass@host:3478">
-                    <span class="form-hint">支持：<code>IP:端口</code>、<code>域名:端口</code>、<code>socks5://user:pass@host:port</code>、<code>http://user:pass@host:port</code>、<code>sstp://host:port</code>、<code>turn://user:pass@host:port</code><br>支持参数：分流代理 <code>fd=</code>、落地代理 <code>ld=</code>、兼容 <code>proxyip=</code></span>
+                    <label for="cfg-proxyip">出站代理列表 (支持 #备注名，生成节点总数 = 优选CDN × 协议数 × 落地数)</label>
+                    <textarea id="cfg-proxyip" class="form-textarea" rows="4" placeholder="支持每行一个，支持 #备注名，例如：&#10;proxy.xxxxxxxx.tk:50001#直连落地&#10;socks5://user:pass@1.2.3.4:1080#香港S5&#10;http://user:pass@5.6.7.8:8080#日本HTTP&#10;sstp://vpn:vpn@domain:443#美国SSTP">${Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0 ? config.proxyIPs.join('\n') : (config.proxyIP || '')}</textarea>
+                    <span class="form-hint">支持：<code>IP:端口#备注</code>、<code>域名:端口#备注</code>、<code>socks5://user:pass@host:port#备注</code>、<code>http://user:pass@host:port#备注</code>、<code>sstp://host:port#备注</code>、<code>turn://user:pass@host:port#备注</code><br>当填写多个落地代理时，生成的节点数量将自动倍增，并在节点名称与连接路径中自动匹配对应落地代理。</span>
                 </div>
             </div>
 
@@ -3580,6 +3648,8 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
         async function saveAdminConfig() {
             const cfipRaw = document.getElementById('cfg-cfip').value;
             const cfipList = cfipRaw.split('\\n').map(s => s.trim()).filter(Boolean);
+            const proxyRaw = document.getElementById('cfg-proxyip').value;
+            const proxyList = proxyRaw.split('\\n').map(s => s.trim()).filter(Boolean);
             const newAdminPwd = document.getElementById('cfg-admin-password').value.trim();
             const newUserPwd = document.getElementById('cfg-password').value.trim();
             
@@ -3591,7 +3661,8 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 SSpath: document.getElementById('cfg-sspath').value.trim(),
                 disabletro: !document.getElementById('cfg-trojan').checked,
                 disabless: !document.getElementById('cfg-ss').checked,
-                proxyIP: document.getElementById('cfg-proxyip').value.trim(),
+                proxyIP: proxyList[0] || '',
+                proxyIPs: proxyList,
                 cfip: cfipList,
                 clashSubUrl: document.getElementById('cfg-clash-sub').value.trim(),
                 singboxSubUrl: document.getElementById('cfg-singbox-sub').value.trim(),
