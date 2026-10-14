@@ -15,7 +15,10 @@ const DEFAULT_CONFIG = {
     adminPassword: 'admin',
     proxyIP: 'proxy.xxxxxxxx.tk:50001',
     proxyIPs: ['proxy.xxxxxxxx.tk:50001'],
+    landingProxy: '',
+    landingProxies: [],
     yourUUID: '5dc15e15-f285-4a9d-959b-0e4fbdd77b63',
+    disablevless: false,
     disabletro: false,
     disabless: false,
     ssMethod: 'aes-256-gcm',
@@ -34,8 +37,11 @@ let password = DEFAULT_CONFIG.password;
 let adminPassword = DEFAULT_CONFIG.adminPassword;
 let proxyIP = DEFAULT_CONFIG.proxyIP;
 let proxyIPs = [...DEFAULT_CONFIG.proxyIPs];
+let landingProxy = DEFAULT_CONFIG.landingProxy;
+let landingProxies = [...DEFAULT_CONFIG.landingProxies];
 let yourUUID = DEFAULT_CONFIG.yourUUID;
 let yourUUIDBytes = null;
+let disablevless = DEFAULT_CONFIG.disablevless;
 let disabletro = DEFAULT_CONFIG.disabletro;
 let disabless = DEFAULT_CONFIG.disabless;
 let ssMethod = DEFAULT_CONFIG.ssMethod;
@@ -58,7 +64,12 @@ async function loadConfig(env) {
         return memoryConfigCache;
     }
 
-    let config = { ...DEFAULT_CONFIG, cfip: [...DEFAULT_CONFIG.cfip], proxyIPs: [...DEFAULT_CONFIG.proxyIPs] };
+    let config = { 
+        ...DEFAULT_CONFIG, 
+        cfip: [...DEFAULT_CONFIG.cfip], 
+        proxyIPs: [...DEFAULT_CONFIG.proxyIPs],
+        landingProxies: [...DEFAULT_CONFIG.landingProxies]
+    };
 
     // 1. 环境变量覆盖
     if (env) {
@@ -73,6 +84,18 @@ async function loadConfig(env) {
                 config.proxyIPs = servers;
                 config.proxyIP = servers[0];
             }
+        }
+        if (env.LANDING_PROXY || env.landing_proxy || env.LD || env.ld) {
+            const rawLd = env.LANDING_PROXY || env.landing_proxy || env.LD || env.ld;
+            const lds = String(rawLd).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
+            if (lds.length > 0) {
+                config.landingProxies = lds;
+                config.landingProxy = lds[0];
+            }
+        }
+        if (env.DISABLE_VLESS !== undefined || env.CLOSE_VLESS !== undefined) {
+            const dv = env.DISABLE_VLESS || env.CLOSE_VLESS;
+            config.disablevless = dv === 'true' || dv === true;
         }
         if (env.DISABLE_TROJAN !== undefined || env.CLOSE_TROJAN !== undefined) {
             const dt = env.DISABLE_TROJAN || env.CLOSE_TROJAN;
@@ -112,7 +135,16 @@ async function loadConfig(env) {
                     config.proxyIPs = servers.length > 0 ? servers : [String(kvData.proxyIP).trim()];
                     config.proxyIP = config.proxyIPs[0] || String(kvData.proxyIP).trim();
                 }
+                if (Array.isArray(kvData.landingProxies) && kvData.landingProxies.length > 0) {
+                    config.landingProxies = kvData.landingProxies.map(s => String(s).trim()).filter(Boolean);
+                    config.landingProxy = config.landingProxies[0] || '';
+                } else if (kvData.landingProxy) {
+                    const lds = String(kvData.landingProxy).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
+                    config.landingProxies = lds.length > 0 ? lds : [String(kvData.landingProxy).trim()];
+                    config.landingProxy = config.landingProxies[0] || String(kvData.landingProxy).trim();
+                }
                 if (Array.isArray(kvData.cfip) && kvData.cfip.length > 0) config.cfip = kvData.cfip.map(s => String(s).trim()).filter(Boolean);
+                if (kvData.disablevless !== undefined) config.disablevless = kvData.disablevless === true || kvData.disablevless === 'true';
                 if (kvData.disabletro !== undefined) config.disabletro = kvData.disabletro === true || kvData.disabletro === 'true';
                 if (kvData.disabless !== undefined) config.disabless = kvData.disabless === true || kvData.disabless === 'true';
                 if (kvData.ssMethod) config.ssMethod = String(kvData.ssMethod).trim();
@@ -659,7 +691,7 @@ class SS_Engine {
                 this.mk = enc_ss.encode(this.cfg.psk).slice(0, I.k); 
             }
         } else {
-            this.mk = await evp_ss(this.cfg.pw, I.k);
+            this.mk = await evp_ss(this.cfg.psk || this.cfg.pw, I.k);
         }
     }
     async decData(data) { 
@@ -817,7 +849,14 @@ const parseSSAddr = d => {
 };
 
 async function deriveSS_Psk(pw, requiredLen) {
-    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', enc_ss.encode(pw)));
+    if (!pw) return '';
+    try {
+        const decoded = atob(String(pw).trim());
+        if (decoded.length === requiredLen) {
+            return String(pw).trim();
+        }
+    } catch (e) {}
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', enc_ss.encode(String(pw))));
     const keyBytes = hash.slice(0, requiredLen);
     let binary = '';
     for (let i = 0; i < keyBytes.length; i++) {
@@ -1240,6 +1279,9 @@ export default {
             subPath = config.subPath;
             proxyIP = config.proxyIP;
             proxyIPs = config.proxyIPs;
+            landingProxy = config.landingProxy;
+            landingProxies = config.landingProxies;
+            disablevless = config.disablevless;
             disabletro = config.disabletro;
             disabless = config.disabless;
             ssMethod = config.ssMethod;
@@ -1286,6 +1328,16 @@ export default {
                             newProxyIPs = body.proxyIP.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
                         }
                         const mainProxyIP = newProxyIPs.length > 0 ? newProxyIPs[0] : (body.proxyIP ? String(body.proxyIP).trim() : config.proxyIP);
+
+                        let newLandingProxies = [];
+                        if (typeof body.landingProxies === 'string') {
+                            newLandingProxies = body.landingProxies.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
+                        } else if (Array.isArray(body.landingProxies)) {
+                            newLandingProxies = body.landingProxies.map(s => String(s).trim()).filter(Boolean);
+                        } else if (typeof body.landingProxy === 'string') {
+                            newLandingProxies = body.landingProxy.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
+                        }
+                        const mainLandingProxy = newLandingProxies.length > 0 ? newLandingProxies[0] : (body.landingProxy ? String(body.landingProxy).trim() : (config.landingProxy || ''));
                         
                         const updatedConfig = {
                             yourUUID: (body.yourUUID && String(body.yourUUID).trim()) || config.yourUUID,
@@ -1293,7 +1345,10 @@ export default {
                             adminPassword: (body.adminPassword && String(body.adminPassword).trim()) || config.adminPassword,
                             subPath: body.subPath !== undefined ? String(body.subPath).trim() : config.subPath,
                             proxyIP: mainProxyIP,
-                            proxyIPs: newProxyIPs.length > 0 ? newProxyIPs : [mainProxyIP],
+                            proxyIPs: newProxyIPs.length > 0 ? newProxyIPs : (mainProxyIP ? [mainProxyIP] : []),
+                            landingProxy: mainLandingProxy,
+                            landingProxies: newLandingProxies.length > 0 ? newLandingProxies : (mainLandingProxy ? [mainLandingProxy] : []),
+                            disablevless: body.disablevless === true || body.disablevless === 'true',
                             disabletro: body.disabletro === true || body.disabletro === 'true',
                             disabless: body.disabless === true || body.disabless === 'true',
                             ssMethod: body.ssMethod ? String(body.ssMethod).trim() : (config.ssMethod || 'aes-256-gcm'),
@@ -1385,22 +1440,48 @@ export default {
 
             // 4. WebSocket 连接
             if (request.headers.get('Upgrade') === 'websocket') {
-                let customProxyIP = pathProxyIP || 
-                    url.searchParams.get('fd') || 
-                    url.searchParams.get('ld') || 
-                    url.searchParams.get('proxyip') || 
-                    request.headers.get('fd') || 
-                    request.headers.get('ld') || 
-                    request.headers.get('proxyip');
+                const reqLd = url.searchParams.get('ld') || request.headers.get('ld');
+                const reqFd = url.searchParams.get('fd') || request.headers.get('fd') || url.searchParams.get('proxyip') || request.headers.get('proxyip');
+                let customProxyIP = pathProxyIP || reqLd || reqFd;
 
-                // 若 customProxyIP 为数字索引 (如 ld=0, ld=1)，自动从 proxyIPs 列表中按索引映射出实际出站代理
+                // 区分索引来源：是 ld 还是 fd
                 if (customProxyIP && /^\d+$/.test(customProxyIP.trim())) {
                     const idx = parseInt(customProxyIP.trim(), 10);
-                    const list = (Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0) ? config.proxyIPs : (config.proxyIP ? [config.proxyIP] : []);
-                    if (list[idx]) {
-                        let raw = list[idx].trim();
+                    let targetList = [];
+                    if (reqLd || (pathProxyIP && pathname.includes('/ld='))) {
+                        targetList = (Array.isArray(config.landingProxies) && config.landingProxies.length > 0)
+                            ? config.landingProxies
+                            : (config.landingProxy ? [config.landingProxy] : []);
+                    } else {
+                        targetList = (Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0)
+                            ? config.proxyIPs
+                            : (config.proxyIP ? [config.proxyIP] : []);
+                    }
+                    if (targetList[idx]) {
+                        let raw = targetList[idx].trim();
                         if (raw.includes('#')) raw = raw.split('#')[0].trim();
                         customProxyIP = raw.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+                    }
+                }
+
+                // 若请求未显式指定落地代理或反代，执行全局互斥决策：全局落地代理优先 > 反代
+                if (!customProxyIP) {
+                    const landingList = (Array.isArray(config.landingProxies) && config.landingProxies.length > 0)
+                        ? config.landingProxies
+                        : (config.landingProxy ? [config.landingProxy] : []);
+                    if (landingList.length > 0 && landingList[0]) {
+                        let raw = landingList[0].trim();
+                        if (raw.includes('#')) raw = raw.split('#')[0].trim();
+                        customProxyIP = raw.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+                    } else {
+                        const proxyList = (Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0)
+                            ? config.proxyIPs
+                            : (config.proxyIP ? [config.proxyIP] : []);
+                        if (proxyList.length > 0 && proxyList[0]) {
+                            let raw = proxyList[0].trim();
+                            if (raw.includes('#')) raw = raw.split('#')[0].trim();
+                            customProxyIP = raw.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+                        }
                     }
                 }
                 return await handleVlsRequest(request, customProxyIP, validSSPath, config);
@@ -1426,11 +1507,19 @@ export default {
                     const resolvedCfip = await resolveCfipList(config.cfip);
 
                     // 解析多落地代理列表 (支持 #备注名，如 socks5://...@1.2.3.4:1080#香港S5)
+                    // 全局落地代理优先决策：若配置了全局落地代理，强制以落地代理出站；未配置落地代理时才生效反代分流
+                    const rawLandingList = (Array.isArray(config.landingProxies) && config.landingProxies.length > 0)
+                        ? config.landingProxies
+                        : (config.landingProxy ? [config.landingProxy] : []);
+
                     const rawProxyList = (Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0)
                         ? config.proxyIPs
                         : (config.proxyIP ? [config.proxyIP] : []);
 
-                    const parsedProxies = rawProxyList.map((item, idx) => {
+                    const isLandingMode = rawLandingList.length > 0;
+                    const rawActiveList = isLandingMode ? rawLandingList : rawProxyList;
+
+                    const parsedProxies = rawActiveList.map((item, idx) => {
                         let rawItem = String(item).trim();
                         let proxyTag = '';
                         if (rawItem.includes('#')) {
@@ -1447,44 +1536,46 @@ export default {
                         };
                     }).filter(p => p.proxyAddr);
 
-                    // 若未配置落地代理，默认保留单路全局/默认出站
+                    // 若未配置落地代理或反代，默认保留单路直连/默认出站
                     const effectiveProxies = parsedProxies.length > 0 ? parsedProxies : [{ proxyAddr: '', proxyTag: '', index: 0, hasRemark: false }];
                     const needIndexRouting = parsedProxies.length > 1 || (parsedProxies.length === 1 && parsedProxies[0].hasRemark);
 
-                    // 生成 VLESS 节点 (优选 CDN × 落地代理)
-                    const vlsLinks = [];
-                    for (const cdnItem of resolvedCfip) {
-                        let host, port = 443, nodeName = '', cdnItemClean = cdnItem;
-                        if (cdnItem.includes('#')) {
-                            const parts = cdnItem.split('#');
-                            cdnItemClean = parts[0];
-                            nodeName = parts[1];
-                        }
+                    // 生成 VLESS 节点 (若未禁用 VLESS)
+                    let vlsLinks = [];
+                    if (!config.disablevless) {
+                        for (const cdnItem of resolvedCfip) {
+                            let host, port = 443, nodeName = '', cdnItemClean = cdnItem;
+                            if (cdnItem.includes('#')) {
+                                const parts = cdnItem.split('#');
+                                cdnItemClean = parts[0];
+                                nodeName = parts[1];
+                            }
 
-                        if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
-                            const ipv6End = cdnItemClean.indexOf(']:');
-                            host = cdnItemClean.substring(0, ipv6End + 1); 
-                            const portStr = cdnItemClean.substring(ipv6End + 2); 
-                            port = parseInt(portStr) || 443;
-                        } else if (cdnItemClean.includes(':')) {
-                            const parts = cdnItemClean.split(':');
-                            host = parts[0];
-                            port = parseInt(parts[1]) || 443;
-                        } else {
-                            host = cdnItemClean;
-                        }
+                            if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
+                                const ipv6End = cdnItemClean.indexOf(']:');
+                                host = cdnItemClean.substring(0, ipv6End + 1); 
+                                const portStr = cdnItemClean.substring(ipv6End + 2); 
+                                port = parseInt(portStr) || 443;
+                            } else if (cdnItemClean.includes(':')) {
+                                const parts = cdnItemClean.split(':');
+                                host = parts[0];
+                                port = parseInt(parts[1]) || 443;
+                            } else {
+                                host = cdnItemClean;
+                            }
 
-                        for (const proxy of effectiveProxies) {
-                            // 规则：有落地且有备注 => 【协议名】-【落地备注】；无落地或无备注 => 【CDN备注】-【协议名】
-                            const vlsNodeName = proxy.hasRemark ? `VLESS-${proxy.proxyTag}` : (nodeName ? `${nodeName}-VLESS` : 'Workers-VLESS');
-                            const wsPath = (proxy.proxyAddr && needIndexRouting)
-                                ? `/?ed=2560&ld=${proxy.index}`
-                                : '/?ed=2560';
-                            vlsLinks.push(`${vlsHeader}://${config.yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${vlsNodeName}`);
+                            for (const proxy of effectiveProxies) {
+                                const prefix = isLandingMode ? 'ld' : 'fd';
+                                const vlsNodeName = proxy.hasRemark ? `VLESS-${proxy.proxyTag}` : (nodeName ? `${nodeName}-VLESS` : 'Workers-VLESS');
+                                const wsPath = (proxy.proxyAddr && needIndexRouting)
+                                    ? `/?ed=2560&${prefix}=${proxy.index}`
+                                    : '/?ed=2560';
+                                vlsLinks.push(`${vlsHeader}://${config.yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${vlsNodeName}`);
+                            }
                         }
                     }
                     
-                    // 生成 Trojan 节点 (优选 CDN × 落地代理)
+                    // 生成 Trojan 节点 (若未禁用 Trojan)
                     let troLinks = [];
                     if (!config.disabletro) {
                         for (const cdnItem of resolvedCfip) {
@@ -1509,23 +1600,26 @@ export default {
                             }
 
                             for (const proxy of effectiveProxies) {
+                                const prefix = isLandingMode ? 'ld' : 'fd';
                                 const troNodeName = proxy.hasRemark ? `Trojan-${proxy.proxyTag}` : (nodeName ? `${nodeName}-Trojan` : 'Workers-Trojan');
                                 const wsPath = (proxy.proxyAddr && needIndexRouting)
-                                    ? `/?ed=2560&ld=${proxy.index}`
+                                    ? `/?ed=2560&${prefix}=${proxy.index}`
                                     : '/?ed=2560';
                                 troLinks.push(`${troHeader}://${config.yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${troNodeName}`);
                             }
                         }
                     }
 
-                    // 生成 Shadowsocks 节点 (优选 CDN × 落地代理)
+                    // 生成 Shadowsocks 节点 (若未禁用 Shadowsocks)
                     let ssLinks = [];
                     if (!config.disabless) {
                         const method = config.ssMethod || 'aes-256-gcm';
                         const methodInfo = C_SS[method] || C_SS['aes-256-gcm'];
-                        let effectivePassword = config.password || config.yourUUID;
+                        let effectivePassword = '';
                         if (methodInfo.b3) {
-                            effectivePassword = config.ssPsk || await deriveSS_Psk(config.password || config.yourUUID, methodInfo.k);
+                            effectivePassword = await deriveSS_Psk(config.ssPsk || config.password || config.yourUUID, methodInfo.k);
+                        } else {
+                            effectivePassword = config.ssPsk || config.password || config.yourUUID;
                         }
                         const ssConfig = `${method}:${effectivePassword}`;
                         const encodedConfig = btoa(ssConfig);
@@ -1553,9 +1647,10 @@ export default {
                             const isHttpPort = [80, 8080, 8880, 2052, 2082, 2086, 2095].includes(port);
 
                             for (const proxy of effectiveProxies) {
+                                const prefix = isLandingMode ? 'ld' : 'fd';
                                 const ssNodeName = proxy.hasRemark ? `SS-${proxy.proxyTag}` : (nodeName ? `${nodeName}-SS` : 'Workers-SS');
                                 const ssWsPath = (proxy.proxyAddr && needIndexRouting)
-                                    ? `${validSSPath}/?ed=2560&ld=${proxy.index}`
+                                    ? `${validSSPath}/?ed=2560&${prefix}=${proxy.index}`
                                     : `${validSSPath}/?ed=2560`;
                                 const pluginParam = isHttpPort
                                     ? `plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${encodeURIComponent(ssWsPath)};mux%3D0`
@@ -1616,6 +1711,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
     const activeConfig = config || {
         yourUUID,
         password,
+        disablevless,
         disabless,
         disabletro,
         ssMethod,
@@ -1626,12 +1722,14 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
     if (!activeConfig.disabless && isSSPath) {
         const method = activeConfig.ssMethod || 'aes-256-gcm';
         const methodInfo = C_SS[method] || C_SS['aes-256-gcm'];
-        let effectivePsk = activeConfig.ssPsk || '';
-        if (methodInfo.b3 && !effectivePsk) {
-            effectivePsk = await deriveSS_Psk(activeConfig.password || activeConfig.yourUUID, methodInfo.k);
+        let effectivePsk = '';
+        if (methodInfo.b3) {
+            effectivePsk = await deriveSS_Psk(activeConfig.ssPsk || activeConfig.password || activeConfig.yourUUID, methodInfo.k);
+        } else {
+            effectivePsk = activeConfig.ssPsk || activeConfig.password || activeConfig.yourUUID;
         }
         ssInstance = new SS_Engine({
-            pw: activeConfig.password || activeConfig.yourUUID,
+            pw: activeConfig.ssPsk || activeConfig.password || activeConfig.yourUUID,
             psk: effectivePsk,
             method: method
         });
@@ -1751,8 +1849,9 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
             }
             
             // 3. 尝试 VLESS 协议解析
-            const vlsResult = parseVLsPacketHeader(chunk, activeConfig.yourUUID, yourUUIDBytes);
-            if (!vlsResult.hasError) {
+            if (!activeConfig.disablevless) {
+                const vlsResult = parseVLsPacketHeader(chunk, activeConfig.yourUUID, yourUUIDBytes);
+                if (!vlsResult.hasError) {
                 const { addressType, port, hostname, rawIndex, version, isUDP } = vlsResult;
 
                 if (isSpeedTestSite(hostname)) {
@@ -1770,8 +1869,9 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                 if (remoteConnWrapper.socket && !upQueue.empty) await flushUpstream();
                 return;
             }
+        }
 
-            throw new Error(vlsResult.message || 'Protocol parse error');
+        throw new Error('Protocol parse error');
         },
     })).catch((err) => {
         // console.error('Readable pipe error:', err);
@@ -2625,12 +2725,19 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
     
     let proxyConfig = null;
     let shouldUseProxy = false;
+
+    // 出站决策优先级：
+    // 1. 若请求明确携带 customProxyIP (如 /ld=... 或 /fd=...)，优先按请求参数出站
+    // 2. 否则按全局配置：全局落地代理 (landingProxies) 优先级最高，一旦配置落地代理，反代自动挂起失效
+    // 3. 若未配置全局落地代理，才回退到反代分流 (proxyIPs)
     if (customProxyIP) {
         if (/^\d+$/.test(customProxyIP.trim())) {
             const idx = parseInt(customProxyIP.trim(), 10);
-            const list = (Array.isArray(proxyIPs) && proxyIPs.length > 0) ? proxyIPs : (proxyIP ? [proxyIP] : []);
-            if (list[idx]) {
-                let raw = list[idx].trim();
+            const targetList = (Array.isArray(landingProxies) && landingProxies.length > 0)
+                ? landingProxies
+                : ((Array.isArray(proxyIPs) && proxyIPs.length > 0) ? proxyIPs : (proxyIP ? [proxyIP] : []));
+            if (targetList[idx]) {
+                let raw = targetList[idx].trim();
                 if (raw.includes('#')) raw = raw.split('#')[0].trim();
                 customProxyIP = raw.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
             }
@@ -2639,12 +2746,23 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn')) {
             shouldUseProxy = true;
         } else if (!proxyConfig) {
-            proxyConfig = parsePryAddress(proxyIP) || { type: 'direct', host: proxyIP, port: 443 };
+            proxyConfig = parsePryAddress(landingProxy || proxyIP) || { type: 'direct', host: (landingProxy || proxyIP), port: 443 };
         }
     } else {
-        proxyConfig = parsePryAddress(proxyIP) || { type: 'direct', host: proxyIP, port: 443 };
-        if (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn') {
-            shouldUseProxy = true;
+        // 全局落地代理优先
+        const effectiveLanding = (Array.isArray(landingProxies) && landingProxies.length > 0) ? landingProxies[0] : landingProxy;
+        if (effectiveLanding) {
+            proxyConfig = parsePryAddress(effectiveLanding);
+            if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn')) {
+                shouldUseProxy = true;
+            }
+        }
+        // 未配置落地代理时，才生效反代
+        if (!proxyConfig && proxyIP) {
+            proxyConfig = parsePryAddress(proxyIP) || { type: 'direct', host: proxyIP, port: 443 };
+            if (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn') {
+                shouldUseProxy = true;
+            }
         }
     }
     
@@ -3185,7 +3303,8 @@ function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
     const clashFullUrl = `${config.clashSubUrl || 'https://sublink.alwaysdata.net/clash?config='}${baseUrl}/${config.subPath}`;
     const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.alwaysdata.net/singbox?config='}${baseUrl}/${config.subPath}`;
     const ssMethod = config.ssMethod || 'aes-256-gcm';
-    const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${config.yourUUID},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
+    const ssEffectivePwd = config.ssPsk || config.password || config.yourUUID;
+    const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${ssEffectivePwd},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
 
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -3654,7 +3773,8 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
     const clashFullUrl = `${config.clashSubUrl || 'https://sublink.alwaysdata.net/clash?config='}${baseUrl}/${config.subPath}`;
     const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.alwaysdata.net/singbox?config='}${baseUrl}/${config.subPath}`;
     const ssMethod = config.ssMethod || 'aes-256-gcm';
-    const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${config.yourUUID},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
+    const ssEffectivePwd = config.ssPsk || config.password || config.yourUUID;
+    const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${ssEffectivePwd},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
 
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -4281,8 +4401,18 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 <h3><i class="fas fa-toggle-on"></i> 协议启用开关</h3>
                 <div class="switch-group">
                     <div class="switch-info">
+                        <span class="switch-title">VLESS 协议</span>
+                        <span class="switch-desc">是否开启 VLESS (WS) 协议节点支持</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="cfg-vless" ${config.disablevless ? '' : 'checked'}>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="switch-group">
+                    <div class="switch-info">
                         <span class="switch-title">Trojan 协议</span>
-                        <span class="switch-desc">是否开启 Trojan 协议节点支持</span>
+                        <span class="switch-desc">是否开启 Trojan (WS) 协议节点支持</span>
                     </div>
                     <label class="switch">
                         <input type="checkbox" id="cfg-trojan" ${config.disabletro ? '' : 'checked'}>
@@ -4301,13 +4431,23 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 </div>
             </div>
 
-            <!-- ProxyIP / 落地出站设置 (支持填写多个，每行一个) -->
+            <!-- 全局落地代理设置 (优先级最高) -->
             <div class="config-card">
-                <h3><i class="fas fa-server"></i> 出站落地代理设置 (支持填写多个，每行一个)</h3>
+                <h3><i class="fas fa-network-wired"></i> 全局落地代理设置 (SOCKS5 / HTTP / SSTP / TURN) <span style="font-size: 0.75rem; background: #10b981; color: white; padding: 2px 8px; border-radius: 12px; margin-left: 8px;">最高优先级</span></h3>
                 <div class="form-group">
-                    <label for="cfg-proxyip">出站代理列表 (支持 #备注名，生成节点总数 = 优选CDN × 协议数 × 落地数)</label>
-                    <textarea id="cfg-proxyip" class="form-textarea" rows="4" placeholder="支持每行一个，支持 #备注名，例如：&#10;proxy.xxxxxxxx.tk:50001#直连落地&#10;socks5://user:pass@1.2.3.4:1080#香港S5&#10;http://user:pass@5.6.7.8:8080#日本HTTP&#10;sstp://vpn:vpn@domain:443#美国SSTP">${Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0 ? config.proxyIPs.join('\n') : (config.proxyIP || '')}</textarea>
-                    <span class="form-hint">支持：<code>IP:端口#备注</code>、<code>域名:端口#备注</code>、<code>socks5://user:pass@host:port#备注</code>、<code>http://user:pass@host:port#备注</code>、<code>sstp://host:port#备注</code>、<code>turn://user:pass@host:port#备注</code><br>当填写多个落地代理时，生成的节点数量将自动倍增，并在节点名称与连接路径中自动匹配对应落地代理。</span>
+                    <label for="cfg-landing-proxy">落地代理列表 (每行一个，支持 #备注名；一旦配置强制走落地代理，反代自动挂起失效)</label>
+                    <textarea id="cfg-landing-proxy" class="form-textarea" rows="4" placeholder="支持每行一个，支持 #备注名，例如：&#10;socks5://user:pass@1.2.3.4:1080#香港S5&#10;http://user:pass@5.6.7.8:8080#日本HTTP&#10;sstp://vpn:vpn@domain:443#美国SSTP&#10;turn://user:pass@domain:3478#德国TURN">${Array.isArray(config.landingProxies) && config.landingProxies.length > 0 ? config.landingProxies.join('\n') : (config.landingProxy || '')}</textarea>
+                    <span class="form-hint">支持协议：<code>socks5://user:pass@host:port#备注</code>、<code>http://user:pass@host:port#备注</code>、<code>sstp://host:port#备注</code>、<code>turn://user:pass@host:port#备注</code><br><strong>优先级最高</strong>：一旦填写了全局落地代理，所有出站流量均强制走落地代理；与下方反代互斥，仅会生效其中一个。</span>
+                </div>
+            </div>
+
+            <!-- 反代 / ProxyIP 设置 (仅当未配置全局落地代理时生效) -->
+            <div class="config-card">
+                <h3><i class="fas fa-server"></i> 分流反代设置 (Proxy IP) <span style="font-size: 0.75rem; background: #64748b; color: white; padding: 2px 8px; border-radius: 12px; margin-left: 8px;">备用出站</span></h3>
+                <div class="form-group">
+                    <label for="cfg-proxyip">反代列表 (仅当未配置上述全局落地代理时生效，支持 #备注名)</label>
+                    <textarea id="cfg-proxyip" class="form-textarea" rows="3" placeholder="支持每行一个，支持 #备注名，例如：&#10;proxy.xxxxxxxx.tk:50001#默认反代&#10;1.2.3.4:443#香港反代">${Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0 ? config.proxyIPs.join('\n') : (config.proxyIP || '')}</textarea>
+                    <span class="form-hint">支持：<code>IP:端口#备注</code>、<code>域名:端口#备注</code>。<strong>仅在未配置全局落地代理时生效</strong>。用于 CDN 回源反代。</span>
                 </div>
             </div>
 
@@ -4453,6 +4593,8 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
         async function saveAdminConfig() {
             const cfipRaw = document.getElementById('cfg-cfip').value;
             const cfipList = cfipRaw.split('\\n').map(s => s.trim()).filter(Boolean);
+            const landingRaw = document.getElementById('cfg-landing-proxy').value;
+            const landingList = landingRaw.split('\\n').map(s => s.trim()).filter(Boolean);
             const proxyRaw = document.getElementById('cfg-proxyip').value;
             const proxyList = proxyRaw.split('\\n').map(s => s.trim()).filter(Boolean);
             const newAdminPwd = document.getElementById('cfg-admin-password').value.trim();
@@ -4466,8 +4608,11 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 SSpath: document.getElementById('cfg-sspath').value.trim(),
                 ssMethod: document.getElementById('cfg-ssmethod').value,
                 ssPsk: document.getElementById('cfg-sspsk').value.trim(),
+                disablevless: !document.getElementById('cfg-vless').checked,
                 disabletro: !document.getElementById('cfg-trojan').checked,
                 disabless: !document.getElementById('cfg-ss').checked,
+                landingProxy: landingList[0] || '',
+                landingProxies: landingList,
                 proxyIP: proxyList[0] || '',
                 proxyIPs: proxyList,
                 cfip: cfipList,
