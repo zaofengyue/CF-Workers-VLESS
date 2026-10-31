@@ -13,8 +13,8 @@ const DEFAULT_CONFIG = {
     subPath: 'link',
     password: '123456',
     adminPassword: 'admin',
-    proxyIP: 'proxy.xxxxxxxx.tk:50001',
-    proxyIPs: ['proxy.xxxxxxxx.tk:50001'],
+    proxyIP: 'ProxyIP.CMLiussss.net',
+    proxyIPs: ['ProxyIP.CMLiussss.net'],
     landingProxy: '',
     landingProxies: [],
     yourUUID: '5dc15e15-f285-4a9d-959b-0e4fbdd77b63',
@@ -24,12 +24,12 @@ const DEFAULT_CONFIG = {
     ssMethod: 'aes-256-gcm',
     ssPsk: '',
     SSpath: '',
-    cfip: [
-        'mfa.gov.ua#SG', 'saas.sin.fan#HK', 'store.ubi.com#JP','cf.130519.xyz#KR','cf.008500.xyz#HK', 
-        'cf.090227.xyz#SG', 'cf.877774.xyz#HK','cdns.doon.eu.org#JP','sub.danfeng.eu.org#TW','cf.zhetengsha.eu.org#HK'
-    ],
-    clashSubUrl: 'https://sublink.alwaysdata.net/clash?config=',
-    singboxSubUrl: 'https://sublink.alwaysdata.net/singbox?config='
+    cfip: [],
+
+
+
+    clashSubUrl: 'https://subapi.194216.xyz/sub?target=clash&url=',
+    singboxSubUrl: 'https://subapi.194216.xyz/sub?target=singbox&url='
 };
 
 let subPath = DEFAULT_CONFIG.subPath;
@@ -135,7 +135,7 @@ async function loadConfig(env) {
                     config.proxyIPs = servers.length > 0 ? servers : [String(kvData.proxyIP).trim()];
                     config.proxyIP = config.proxyIPs[0] || String(kvData.proxyIP).trim();
                 }
-                if (Array.isArray(kvData.landingProxies) && kvData.landingProxies.length > 0) {
+                if (Array.isArray(kvData.landingProxies)) {
                     config.landingProxies = kvData.landingProxies.map(s => String(s).trim()).filter(Boolean);
                     config.landingProxy = config.landingProxies[0] || '';
                 } else if (kvData.landingProxy) {
@@ -143,7 +143,7 @@ async function loadConfig(env) {
                     config.landingProxies = lds.length > 0 ? lds : [String(kvData.landingProxy).trim()];
                     config.landingProxy = config.landingProxies[0] || String(kvData.landingProxy).trim();
                 }
-                if (Array.isArray(kvData.cfip) && kvData.cfip.length > 0) config.cfip = kvData.cfip.map(s => String(s).trim()).filter(Boolean);
+                if (Array.isArray(kvData.cfip)) config.cfip = kvData.cfip.map(s => String(s).trim()).filter(Boolean);
                 if (kvData.disablevless !== undefined) config.disablevless = kvData.disablevless === true || kvData.disablevless === 'true';
                 if (kvData.disabletro !== undefined) config.disabletro = kvData.disabletro === true || kvData.disabletro === 'true';
                 if (kvData.disabless !== undefined) config.disabless = kvData.disabless === true || kvData.disabless === 'true';
@@ -1055,7 +1055,7 @@ function base64ToArray(b64Str) {
  * @returns {Promise<string[]>}
  */
 async function resolveCfipList(cfipList) {
-    if (!Array.isArray(cfipList) || cfipList.length === 0) return [];
+    if (!Array.isArray(cfipList) || cfipList.length === 0) return ['www.visa.com.tw'];
     const resolved = [];
     for (const item of cfipList) {
         const trimmed = String(item).trim();
@@ -1081,7 +1081,7 @@ async function resolveCfipList(cfipList) {
             resolved.push(trimmed);
         }
     }
-    return resolved.length > 0 ? resolved : cfipList;
+    return resolved.length > 0 ? resolved : ['www.visa.com.tw'];
 }
 
 function parsePryAddress(serverStr) {
@@ -1337,7 +1337,7 @@ export default {
                         } else if (typeof body.landingProxy === 'string') {
                             newLandingProxies = body.landingProxy.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
                         }
-                        const mainLandingProxy = newLandingProxies.length > 0 ? newLandingProxies[0] : (body.landingProxy ? String(body.landingProxy).trim() : (config.landingProxy || ''));
+                        const mainLandingProxy = newLandingProxies.length > 0 ? newLandingProxies[0] : (body.landingProxy !== undefined ? String(body.landingProxy).trim() : '');
                         
                         const updatedConfig = {
                             yourUUID: (body.yourUUID && String(body.yourUUID).trim()) || config.yourUUID,
@@ -1347,14 +1347,14 @@ export default {
                             proxyIP: mainProxyIP,
                             proxyIPs: newProxyIPs.length > 0 ? newProxyIPs : (mainProxyIP ? [mainProxyIP] : []),
                             landingProxy: mainLandingProxy,
-                            landingProxies: newLandingProxies.length > 0 ? newLandingProxies : (mainLandingProxy ? [mainLandingProxy] : []),
+                            landingProxies: newLandingProxies,
                             disablevless: body.disablevless === true || body.disablevless === 'true',
                             disabletro: body.disabletro === true || body.disabletro === 'true',
                             disabless: body.disabless === true || body.disabless === 'true',
                             ssMethod: body.ssMethod ? String(body.ssMethod).trim() : (config.ssMethod || 'aes-256-gcm'),
                             ssPsk: body.ssPsk !== undefined ? String(body.ssPsk).trim() : (config.ssPsk || ''),
                             SSpath: body.SSpath !== undefined ? String(body.SSpath).trim() : config.SSpath,
-                            cfip: newCfip.length > 0 ? newCfip : config.cfip,
+                            cfip: body.cfip !== undefined ? newCfip : config.cfip,
                             clashSubUrl: (body.clashSubUrl && String(body.clashSubUrl).trim()) || config.clashSubUrl,
                             singboxSubUrl: (body.singboxSubUrl && String(body.singboxSubUrl).trim()) || config.singboxSubUrl
                         };
@@ -3299,9 +3299,29 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false) {
  * @param {boolean} hasKV
  * @returns {Response}
  */
+function formatSubconverterUrl(prefix, target, rawUrl) {
+    const encodedRaw = encodeURIComponent(rawUrl);
+    if (!prefix) {
+        return `https://subapi.194216.xyz/sub?target=${target}&url=${encodedRaw}&insert=false`;
+    }
+    if (prefix.includes('url=')) {
+        if (prefix.endsWith('=') || prefix.endsWith('&')) {
+            return `${prefix}${encodedRaw}`;
+        }
+        return `${prefix}&url=${encodedRaw}`;
+    }
+    if (prefix.includes('target=')) {
+        const joinChar = prefix.includes('?') ? (prefix.endsWith('?') || prefix.endsWith('&') ? '' : '&') : '?';
+        return `${prefix}${joinChar}url=${encodedRaw}`;
+    }
+    const cleanPrefix = prefix.replace(/\/+$/, '');
+    return `${cleanPrefix}/sub?target=${target}&url=${encodedRaw}&insert=false`;
+}
+
 function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
-    const clashFullUrl = `${config.clashSubUrl || 'https://sublink.alwaysdata.net/clash?config='}${baseUrl}/${config.subPath}`;
-    const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.alwaysdata.net/singbox?config='}${baseUrl}/${config.subPath}`;
+    const rawSubUrl = `${baseUrl}/${config.subPath}`;
+    const clashFullUrl = formatSubconverterUrl(config.clashSubUrl, 'clash', rawSubUrl);
+    const singboxFullUrl = formatSubconverterUrl(config.singboxSubUrl, 'singbox', rawSubUrl);
     const ssMethod = config.ssMethod || 'aes-256-gcm';
     const ssEffectivePwd = config.ssPsk || config.password || config.yourUUID;
     const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${ssEffectivePwd},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
@@ -3770,8 +3790,9 @@ function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
  * @returns {Response}
  */
 function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
-    const clashFullUrl = `${config.clashSubUrl || 'https://sublink.alwaysdata.net/clash?config='}${baseUrl}/${config.subPath}`;
-    const singboxFullUrl = `${config.singboxSubUrl || 'https://sublink.alwaysdata.net/singbox?config='}${baseUrl}/${config.subPath}`;
+    const rawSubUrl = `${baseUrl}/${config.subPath}`;
+    const clashFullUrl = formatSubconverterUrl(config.clashSubUrl, 'clash', rawSubUrl);
+    const singboxFullUrl = formatSubconverterUrl(config.singboxSubUrl, 'singbox', rawSubUrl);
     const ssMethod = config.ssMethod || 'aes-256-gcm';
     const ssEffectivePwd = config.ssPsk || config.password || config.yourUUID;
     const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${ssEffectivePwd},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
@@ -4446,7 +4467,7 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 <h3><i class="fas fa-server"></i> 分流反代设置 (Proxy IP) <span style="font-size: 0.75rem; background: #64748b; color: white; padding: 2px 8px; border-radius: 12px; margin-left: 8px;">备用出站</span></h3>
                 <div class="form-group">
                     <label for="cfg-proxyip">反代列表 (仅当未配置上述全局落地代理时生效，支持 #备注名)</label>
-                    <textarea id="cfg-proxyip" class="form-textarea" rows="3" placeholder="支持每行一个，支持 #备注名，例如：&#10;proxy.xxxxxxxx.tk:50001#默认反代&#10;1.2.3.4:443#香港反代">${Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0 ? config.proxyIPs.join('\n') : (config.proxyIP || '')}</textarea>
+                    <textarea id="cfg-proxyip" class="form-textarea" rows="3" placeholder="支持每行一个，支持 #备注名，例如：&#10;ProxyIP.CMLiussss.net#默认反代&#10;1.2.3.4:443#香港反代">${Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0 ? config.proxyIPs.join('\n') : (config.proxyIP || '')}</textarea>
                     <span class="form-hint">支持：<code>IP:端口#备注</code>、<code>域名:端口#备注</code>。<strong>仅在未配置全局落地代理时生效</strong>。用于 CDN 回源反代。</span>
                 </div>
             </div>
@@ -4455,8 +4476,8 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
             <div class="config-card">
                 <h3><i class="fas fa-bolt"></i> 优选 CDN 域名、IP 列表或远程订阅链接 (每行一个)</h3>
                 <div class="form-group">
-                    <textarea id="cfg-cfip" class="form-textarea" rows="7" placeholder="格式支持:&#10;优选域名:端口#名称&#10;优选IP:端口#名称&#10;[IPv6]:端口#名称&#10;https://gist.githubusercontent.com/.../raw/... (远程文本订阅链接)">${config.cfip.join('\n')}</textarea>
-                    <span class="form-hint">支持填入 <code>优选域名:端口#节点名称</code>、<code>优选IP:端口#名称</code>，或直接填入 <code>https://...</code> 远程文本订阅/Gist Raw 链接（将自动抓取展开合并到订阅中）</span>
+                    <textarea id="cfg-cfip" class="form-textarea" rows="7" placeholder="默认为空（未填写时自动使用 www.visa.com.tw 优选）。&#10;如需自定义，格式支持:&#10;优选域名:端口#名称&#10;优选IP:端口#名称&#10;[IPv6]:端口#名称&#10;https://... (远程文本订阅链接)">${(Array.isArray(config.cfip) && !(config.cfip.length === 1 && config.cfip[0] === 'www.visa.com.tw')) ? config.cfip.join('\n') : ''}</textarea>
+                    <span class="form-hint">默认为空，出站自动使用 <code>www.visa.com.tw</code>。若填写了自定义优选节点，则优先使用填写的节点。支持 <code>域名:端口#名称</code>、<code>IP:端口#名称</code>，或 <code>https://...</code> 远程订阅链接。</span>
                 </div>
             </div>
 
@@ -4467,12 +4488,12 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                     <div class="form-group">
                         <label for="cfg-clash-sub">Clash 订阅转换前缀</label>
                         <input type="text" id="cfg-clash-sub" class="form-input" value="${config.clashSubUrl}">
-                        <span class="form-hint">默认: https://sublink.alwaysdata.net/clash?config=</span>
+                        <span class="form-hint">默认: https://subapi.194216.xyz/sub?target=clash&url=</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-singbox-sub">Sing-box 订阅转换前缀</label>
                         <input type="text" id="cfg-singbox-sub" class="form-input" value="${config.singboxSubUrl}">
-                        <span class="form-hint">默认: https://sublink.alwaysdata.net/singbox?config=</span>
+                        <span class="form-hint">默认: https://subapi.194216.xyz/sub?target=singbox&url=</span>
                     </div>
                 </div>
             </div>
