@@ -1440,8 +1440,28 @@ export default {
 
             // 4. WebSocket 连接
             if (request.headers.get('Upgrade') === 'websocket') {
-                const reqLd = url.searchParams.get('ld') || request.headers.get('ld');
-                const reqFd = url.searchParams.get('fd') || request.headers.get('fd') || url.searchParams.get('proxyip') || request.headers.get('proxyip');
+                // 1. 标准提取 (从 URL 查询参数或 Headers 中获取)
+                let reqLd = url.searchParams.get('ld') || request.headers.get('ld');
+                let reqFd = url.searchParams.get('fd') || request.headers.get('fd') || url.searchParams.get('proxyip') || request.headers.get('proxyip');
+
+                // 2. 原始请求 URL 深度解码与正则兜底
+                // 兼容部分客户端对 ?, &, = 等字符进行 URL 编码的情况 (如 Trojan 在部分客户端下发送 /%3Fed=2560%26ld=3)
+                if (!reqLd && !reqFd) {
+                    let rawUrl = '';
+                    try {
+                        rawUrl = decodeURIComponent(request.url);
+                    } catch (e) {
+                        rawUrl = request.url || '';
+                    }
+                    const ldMatch = rawUrl.match(/[?&;/]ld=((?:sstp|turn|socks5|socks|https|http):\/\/[^\s?&#]+)/i) ||
+                                    rawUrl.match(/[?&;/]ld=([^/?&#\s]+)/i);
+                    if (ldMatch) reqLd = ldMatch[1].trim();
+
+                    const fdMatch = rawUrl.match(/[?&;/](?:fd|proxyip)=((?:sstp|turn|socks5|socks|https|http):\/\/[^\s?&#]+)/i) ||
+                                    rawUrl.match(/[?&;/](?:fd|proxyip)=([^/?&#\s]+)/i);
+                    if (fdMatch) reqFd = fdMatch[1].trim();
+                }
+
                 let customProxyIP = pathProxyIP || reqLd || reqFd;
 
                 // 区分索引来源：是 ld 还是 fd
@@ -1605,7 +1625,7 @@ export default {
                                 const wsPath = (proxy.proxyAddr && needIndexRouting)
                                     ? `/?ed=2560&${prefix}=${proxy.index}`
                                     : '/?ed=2560';
-                                troLinks.push(`${troHeader}://${config.yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${troNodeName}`);
+                                troLinks.push(`${troHeader}://${config.yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}&wspath=${encodeURIComponent(wsPath)}#${troNodeName}`);
                             }
                         }
                     }
