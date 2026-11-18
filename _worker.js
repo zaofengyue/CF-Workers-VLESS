@@ -28,8 +28,8 @@ const DEFAULT_CONFIG = {
 
 
 
-    clashSubUrl: 'https://subapi.194216.xyz/sub?target=clash&url=',
-    singboxSubUrl: 'https://subapi.194216.xyz/sub?target=singbox&url='
+    clashSubUrl: '',
+    singboxSubUrl: ''
 };
 
 let subPath = DEFAULT_CONFIG.subPath;
@@ -153,8 +153,14 @@ async function loadConfig(env) {
                 if (kvData.ssMethod) config.ssMethod = String(kvData.ssMethod).trim();
                 if (kvData.ssPsk !== undefined && kvData.ssPsk !== null) config.ssPsk = String(kvData.ssPsk).trim();
                 if (kvData.SSpath !== undefined && kvData.SSpath !== null) config.SSpath = String(kvData.SSpath).trim();
-                if (kvData.clashSubUrl) config.clashSubUrl = String(kvData.clashSubUrl).trim();
-                if (kvData.singboxSubUrl) config.singboxSubUrl = String(kvData.singboxSubUrl).trim();
+                if (kvData.clashSubUrl !== undefined && kvData.clashSubUrl !== null) {
+                    const cUrl = String(kvData.clashSubUrl).trim();
+                    config.clashSubUrl = (cUrl === 'https://subapi.194216.xyz/sub?target=clash&url=') ? '' : cUrl;
+                }
+                if (kvData.singboxSubUrl !== undefined && kvData.singboxSubUrl !== null) {
+                    const sUrl = String(kvData.singboxSubUrl).trim();
+                    config.singboxSubUrl = (sUrl === 'https://subapi.194216.xyz/sub?target=singbox&url=') ? '' : sUrl;
+                }
             }
         } catch (e) {
             // KV 读取失败时使用降级配置
@@ -874,7 +880,7 @@ const GRAIN_CFG = {
     dnTail: 512,
     dnQr: 4,
     upPack: 20 * 1024,
-    concur: 4
+    concur: 2
 };
 
 function uuidToBytes(uuidStr) {
@@ -919,19 +925,50 @@ const sprout = (f, h, p) => {
     }
 };
 
-const raceSprout = (f, h, p, concur = 4) => {
+const raceSprout = (f, h, p, concur = 2) => {
     if (!f || typeof f.connect !== 'function') {
         return Promise.reject(new Error('connect unavailable'));
     }
     if (concur <= 1) return sprout(f, h, p);
-    const ts = Array(concur).fill(null).map(() => sprout(f, h, p));
-    return Promise.any(ts).then(winner => {
-        ts.forEach(t => {
-            t.then(s => {
-                if (s !== winner) closeSocketQuietly(s);
-            }).catch(() => {});
-        });
-        return winner;
+    // Happy Eyeballs 阶梯竞速：先发 1 路，若 220ms 未握手完成或提前失败再补发第 2 路，大幅节省连接配额
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let timer = 0;
+        let startedSecond = false;
+        let failedCount = 0;
+        let totalStarted = 1;
+        let lastErr = null;
+        const onWin = sock => {
+            if (settled) {
+                closeSocketQuietly(sock);
+                return;
+            }
+            settled = true;
+            if (timer) clearTimeout(timer);
+            resolve(sock);
+        };
+        const onFail = err => {
+            lastErr = err;
+            failedCount++;
+            if (!settled && !startedSecond) {
+                if (timer) clearTimeout(timer);
+                launchBackup();
+                return;
+            }
+            if (!settled && failedCount >= totalStarted) {
+                settled = true;
+                if (timer) clearTimeout(timer);
+                reject(lastErr || new Error('Connection failed'));
+            }
+        };
+        const launchBackup = () => {
+            if (settled || startedSecond) return;
+            startedSecond = true;
+            totalStarted = 2;
+            sprout(f, h, p).then(onWin, onFail);
+        };
+        timer = setTimeout(launchBackup, 220);
+        sprout(f, h, p).then(onWin, onFail);
     });
 };
 
@@ -1375,8 +1412,8 @@ export default {
                             ssPsk: body.ssPsk !== undefined ? String(body.ssPsk).trim() : (config.ssPsk || ''),
                             SSpath: body.SSpath !== undefined ? String(body.SSpath).trim() : config.SSpath,
                             cfip: body.cfip !== undefined ? newCfip : config.cfip,
-                            clashSubUrl: (body.clashSubUrl && String(body.clashSubUrl).trim()) || config.clashSubUrl,
-                            singboxSubUrl: (body.singboxSubUrl && String(body.singboxSubUrl).trim()) || config.singboxSubUrl
+                            clashSubUrl: body.clashSubUrl !== undefined ? String(body.clashSubUrl).trim() : config.clashSubUrl,
+                            singboxSubUrl: body.singboxSubUrl !== undefined ? String(body.singboxSubUrl).trim() : config.singboxSubUrl
                         };
                         await saveConfig(env, updatedConfig);
                         const secureFlag = url.protocol === 'https:' ? '; Secure' : '';
@@ -1522,186 +1559,63 @@ export default {
                     return await getNodesPage(request, validSSPath, config, hasKV);
                 }
                 
-                // 7. 订阅输出 (精确路径匹配)
+                // 7. 订阅输出 (支持 Base64 通用 / Sing-box 1.14 JSON / FlClash & 原版 Clash 双模 YAML)
                 const cleanReqPath = url.pathname.replace(/\/+$/, '').toLowerCase();
                 const cleanSubPath = `/${config.subPath.replace(/^\/+|\/+$/g, '').toLowerCase()}`;
                 if (cleanReqPath === cleanSubPath) {
                     const currentDomain = url.hostname;
-                    const vlsHeader = 'v' + 'l' + 'e' + 's' + 's';
-                    const troHeader = 't' + 'r' + 'o' + 'j' + 'a' + 'n';
-                    const ssHeader = 's' + 's';
-                    
-                    // 解析优选节点 (支持本地列表与远程 Gist / URL 订阅自动拉取合并)
-                    const resolvedCfip = await resolveCfipList(config.cfip);
-
-                    // 解析多落地代理列表 (支持 #备注名，如 socks5://...@1.2.3.4:1080#香港S5)
-                    // 全局落地代理优先决策：若配置了全局落地代理，强制以落地代理出站；未配置落地代理时才生效反代分流
-                    const rawLandingList = (Array.isArray(config.landingProxies) && config.landingProxies.length > 0)
-                        ? config.landingProxies
-                        : (config.landingProxy ? [config.landingProxy] : []);
-
-                    const rawProxyList = (Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0)
-                        ? config.proxyIPs
-                        : (config.proxyIP ? [config.proxyIP] : []);
-
-                    const isLandingMode = rawLandingList.length > 0;
-                    const rawActiveList = isLandingMode ? rawLandingList : rawProxyList;
-
-                    const parsedProxies = rawActiveList.map((item, idx) => {
-                        let rawItem = String(item).trim();
-                        let proxyTag = '';
-                        if (rawItem.includes('#')) {
-                            const parts = rawItem.split('#');
-                            rawItem = parts[0].trim();
-                            proxyTag = parts[1].trim();
-                        }
-                        const cleanAddr = rawItem.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
-                        return {
-                            proxyAddr: cleanAddr,
-                            proxyTag: proxyTag,
-                            index: idx,
-                            hasRemark: !!proxyTag
-                        };
-                    }).filter(p => p.proxyAddr);
-
-                    // 若未配置落地代理或反代，默认保留单路直连/默认出站
-                    const effectiveProxies = parsedProxies.length > 0 ? parsedProxies : [{ proxyAddr: '', proxyTag: '', index: 0, hasRemark: false }];
-                    const needIndexRouting = parsedProxies.length > 1 || (parsedProxies.length === 1 && parsedProxies[0].hasRemark);
-
-                    // 生成 VLESS 节点 (若未禁用 VLESS)
-                    let vlsLinks = [];
-                    if (!config.disablevless) {
-                        for (const cdnItem of resolvedCfip) {
-                            let host, port = 443, nodeName = '', cdnItemClean = cdnItem;
-                            if (cdnItem.includes('#')) {
-                                const parts = cdnItem.split('#');
-                                cdnItemClean = parts[0];
-                                nodeName = parts[1];
-                            }
-
-                            if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
-                                const ipv6End = cdnItemClean.indexOf(']:');
-                                host = cdnItemClean.substring(0, ipv6End + 1); 
-                                const portStr = cdnItemClean.substring(ipv6End + 2); 
-                                port = parseInt(portStr) || 443;
-                            } else if (cdnItemClean.includes(':')) {
-                                const parts = cdnItemClean.split(':');
-                                host = parts[0];
-                                port = parseInt(parts[1]) || 443;
-                            } else {
-                                host = cdnItemClean;
-                            }
-
-                            for (const proxy of effectiveProxies) {
-                                const prefix = isLandingMode ? 'ld' : 'fd';
-                                const vlsNodeName = proxy.hasRemark ? `VLESS-${proxy.proxyTag}` : (nodeName ? `${nodeName}-VLESS` : 'Workers-VLESS');
-                                const wsPath = (proxy.proxyAddr && needIndexRouting)
-                                    ? `/?ed=2560&${prefix}=${proxy.index}`
-                                    : '/?ed=2560';
-                                vlsLinks.push(`${vlsHeader}://${config.yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${vlsNodeName}`);
-                            }
-                        }
-                    }
-                    
-                    // 生成 Trojan 节点 (若未禁用 Trojan)
-                    let troLinks = [];
-                    if (!config.disabletro) {
-                        for (const cdnItem of resolvedCfip) {
-                            let host, port = 443, nodeName = '', cdnItemClean = cdnItem;
-                            if (cdnItem.includes('#')) {
-                                const parts = cdnItem.split('#');
-                                cdnItemClean = parts[0];
-                                nodeName = parts[1];
-                            }
-
-                            if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
-                                const ipv6End = cdnItemClean.indexOf(']:');
-                                host = cdnItemClean.substring(0, ipv6End + 1); 
-                                const portStr = cdnItemClean.substring(ipv6End + 2); 
-                                port = parseInt(portStr) || 443;
-                            } else if (cdnItemClean.includes(':')) {
-                                const parts = cdnItemClean.split(':');
-                                host = parts[0];
-                                port = parseInt(parts[1]) || 443;
-                            } else {
-                                host = cdnItemClean;
-                            }
-
-                            for (const proxy of effectiveProxies) {
-                                const prefix = isLandingMode ? 'ld' : 'fd';
-                                const troNodeName = proxy.hasRemark ? `Trojan-${proxy.proxyTag}` : (nodeName ? `${nodeName}-Trojan` : 'Workers-Trojan');
-                                const wsPath = (proxy.proxyAddr && needIndexRouting)
-                                    ? `/?ed=2560&${prefix}=${proxy.index}`
-                                    : '/?ed=2560';
-                                troLinks.push(`${troHeader}://${config.yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}&wspath=${encodeURIComponent(wsPath)}#${troNodeName}`);
-                            }
-                        }
-                    }
-
-                    // 生成 Shadowsocks 节点 (若未禁用 Shadowsocks)
-                    let ssLinks = [];
-                    if (!config.disabless) {
-                        const method = config.ssMethod || 'aes-256-gcm';
-                        const methodInfo = C_SS[method] || C_SS['aes-256-gcm'];
-                        let effectivePassword = '';
-                        if (methodInfo.b3) {
-                            effectivePassword = await deriveSS_Psk(config.ssPsk || config.password || config.yourUUID, methodInfo.k);
-                        } else {
-                            effectivePassword = config.ssPsk || config.password || config.yourUUID;
-                        }
-                        const ssConfig = `${method}:${effectivePassword}`;
-                        const encodedConfig = btoa(ssConfig);
-                        for (const cdnItem of resolvedCfip) {
-                            let host, port = 443, nodeName = '', cdnItemClean = cdnItem;
-                            if (cdnItem.includes('#')) {
-                                const parts = cdnItem.split('#');
-                                cdnItemClean = parts[0];
-                                nodeName = parts[1];
-                            }
-
-                            if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
-                                const ipv6End = cdnItemClean.indexOf(']:');
-                                host = cdnItemClean.substring(0, ipv6End + 1); 
-                                const portStr = cdnItemClean.substring(ipv6End + 2); 
-                                port = parseInt(portStr) || 443;
-                            } else if (cdnItemClean.includes(':')) {
-                                const parts = cdnItemClean.split(':');
-                                host = parts[0];
-                                port = parseInt(parts[1]) || 443;
-                            } else {
-                                host = cdnItemClean;
-                            }
-
-                            const isHttpPort = [80, 8080, 8880, 2052, 2082, 2086, 2095].includes(port);
-
-                            for (const proxy of effectiveProxies) {
-                                const prefix = isLandingMode ? 'ld' : 'fd';
-                                const ssNodeName = proxy.hasRemark ? `SS-${proxy.proxyTag}` : (nodeName ? `${nodeName}-SS` : 'Workers-SS');
-                                const ssWsPath = (proxy.proxyAddr && needIndexRouting)
-                                    ? `${validSSPath}/?ed=2560&${prefix}=${proxy.index}`
-                                    : `${validSSPath}/?ed=2560`;
-                                const pluginParam = isHttpPort
-                                    ? `plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${encodeURIComponent(ssWsPath)};mux%3D0`
-                                    : `plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${encodeURIComponent(ssWsPath)};tls;sni%3D${currentDomain};skip-cert-verify%3Dtrue;mux%3D0`;
-                                ssLinks.push(`${ssHeader}://${encodedConfig}@${host}:${port}?${pluginParam}#${ssNodeName}`);
-                            }
-                        }
-                    }
-
-                    let allLinks = [...vlsLinks, ...troLinks, ...ssLinks];
-                    const filterType = url.searchParams.get('type') ? url.searchParams.get('type').toLowerCase() : '';
+                    const allNodes = await buildAllNodes(config, currentDomain, validSSPath);
+                    const filterType = (url.searchParams.get('type') || '').toLowerCase();
+                    let filteredNodes = allNodes;
                     if (filterType === 'ss' || filterType === 'shadowsocks') {
-                        allLinks = ssLinks;
+                        filteredNodes = allNodes.filter(n => n.protocol === 'ss');
                     } else if (filterType === 'vless') {
-                        allLinks = vlsLinks;
+                        filteredNodes = allNodes.filter(n => n.protocol === 'vless');
                     } else if (filterType === 'trojan') {
-                        allLinks = troLinks;
+                        filteredNodes = allNodes.filter(n => n.protocol === 'trojan');
                     }
 
-                    const linksText = allLinks.join('\n');
+                    const targetFmt = (url.searchParams.get('target') || url.searchParams.get('format') || '').toLowerCase();
+                    if (targetFmt === 'singbox' || targetFmt === 'sing-box') {
+                        const sbJson = generateSingboxConfig(filteredNodes);
+                        return new Response(JSON.stringify(sbJson, null, 2), {
+                            headers: {
+                                'Content-Type': 'application/json; charset=utf-8',
+                                'Content-Disposition': "attachment; filename*=UTF-8''Workers-Singbox.json",
+                                'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
+                            }
+                        });
+                    }
+                    if (targetFmt === 'clash' || targetFmt === 'mihomo' || targetFmt === 'clash-meta' || targetFmt === 'clash-classic') {
+                        const metaParam = url.searchParams.get('meta');
+                        let isMeta = true;
+                        if (targetFmt === 'mihomo' || targetFmt === 'clash-meta' || metaParam === '1' || metaParam === 'true') {
+                            isMeta = true;
+                        } else if (targetFmt === 'clash-classic' || metaParam === '0' || metaParam === 'false') {
+                            isMeta = false;
+                        } else {
+                            const ua = (request.headers.get('User-Agent') || '').toLowerCase();
+                            if (/flclash|mihomo|meta|verge|stash|party|clashmi|nikki|openclash|pandora|nya/.test(ua)) {
+                                isMeta = true;
+                            } else if (ua.includes('clash')) {
+                                isMeta = false;
+                            }
+                        }
+                        const yamlText = generateClashConfig(filteredNodes, isMeta);
+                        return new Response(yamlText, {
+                            headers: {
+                                'Content-Type': 'text/yaml; charset=utf-8',
+                                'Content-Disposition': "attachment; filename*=UTF-8''Workers-Clash.yaml",
+                                'profile-update-interval': '24',
+                                'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
+                            }
+                        });
+                    }
+
+                    const linksText = filteredNodes.map(n => n.uri).join('\n');
                     const base64Content = btoa(unescape(encodeURIComponent(linksText)));
                     return new Response(base64Content, {
-                        headers: { 
+                        headers: {
                             'Content-Type': 'text/plain; charset=utf-8',
                             'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
                         },
@@ -1729,6 +1643,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
     let remoteConnWrapper = { socket: null };
     let isDnsQuery = false;
     let isTrojan = false;
+    let isTrojanUdp = false;
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
 
@@ -1793,6 +1708,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
 
     readable.pipeTo(new WritableStream({
         async write(chunk) {
+            if (isTrojanUdp) return await forwardTrojanUdpDns(chunk, serverSock);
             if (isDnsQuery) return await forwardataudp(chunk, serverSock, null, ssInstance);
             if (remoteConnWrapper.socket) {
                 if (ssInstance) {
@@ -1888,12 +1804,20 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                 const trojanResult = await parsetroHeader(chunk, activeConfig.yourUUID, expectedHash);
                 if (!trojanResult.hasError) {
                     isTrojan = true;
-                    const { addressType, port, hostname, rawClientData } = trojanResult;
-                    
+                    const { addressType, port, hostname, rawClientData, isUDP } = trojanResult;
                     if (isSpeedTestSite(hostname)) {
                         throw new Error('Speedtest site is blocked');
                     }
-                    
+                    if (isUDP) {
+                        if (port === 53) {
+                            isTrojanUdp = true;
+                            if (rawClientData && rawClientData.byteLength > 0) {
+                                await forwardTrojanUdpDns(rawClientData, serverSock);
+                            }
+                            return;
+                        }
+                        throw new Error('Trojan UDP is only supported for DNS port 53');
+                    }
                     await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, customProxyIP, request);
                     if (remoteConnWrapper.socket && !upQueue.empty) await flushUpstream();
                     return;
@@ -1934,9 +1858,10 @@ async function parsetroHeader(buffer, passwordPlainText, precomputedHash = null)
   }
 
   const cmd = u8[socks5Offset];
-  if (cmd !== 1) {
-    return { hasError: true, message: "unsupported command, only TCP is allowed" };
+  if (cmd !== 1 && cmd !== 3) {
+    return { hasError: true, message: "unsupported command" };
   }
+  const isUDP = cmd === 3;
 
   const atype = u8[socks5Offset + 1];
   let addressLength = 0;
@@ -1983,6 +1908,7 @@ async function parsetroHeader(buffer, passwordPlainText, precomputedHash = null)
     addressType: atype,
     port: portRemote,
     hostname: address,
+    isUDP,
     rawClientData
   };
 }
@@ -2168,18 +2094,37 @@ async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
     }
 }
 
-// ------------------------- DoH DNS 解析 -------------------------
+// ------------------------- DoH DNS 解析 (含 5 分钟内存缓存) -------------------------
+const dnsMemoryCache = new Map();
+const DNS_CACHE_TTL_MS = 300000;
+
 async function resolveDnsA(host) {
     if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return host;
+    const key = String(host).toLowerCase();
+    const now = Date.now();
+    const cached = dnsMemoryCache.get(key);
+    if (cached && now < cached.exp) return cached.ip;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
     try {
-        const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`, {
-            headers: { Accept: 'application/dns-json' }
+        const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(key)}&type=A`, {
+            headers: { Accept: 'application/dns-json' },
+            signal: controller.signal
         });
         const json = await res.json();
         const ans = json.Answer?.find(a => a.type === 1);
-        return ans?.data || null;
+        const ip = ans?.data || null;
+        if (ip) {
+            if (dnsMemoryCache.size >= 500) {
+                dnsMemoryCache.delete(dnsMemoryCache.keys().next().value);
+            }
+            dnsMemoryCache.set(key, { ip, exp: now + DNS_CACHE_TTL_MS });
+        }
+        return ip;
     } catch (e) {
         return null;
+    } finally {
+        clearTimeout(timer);
     }
 }
 
@@ -3080,36 +3025,595 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, ss
     }
 }
 
-async function forwardataudp(udpChunk, webSocket, respHeader, ssInstance) {
+async function resolveRawDnsWire(dnsQueryBytes) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
     try {
-        const tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
-        let vlessHeader = respHeader;
+        const resp = await fetch('https://1.1.1.1/dns-query', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/dns-message',
+                'Accept': 'application/dns-message'
+            },
+            body: dnsQueryBytes,
+            signal: controller.signal
+        });
+        if (resp.ok) {
+            return new Uint8Array(await resp.arrayBuffer());
+        }
+    } catch (e) {
+        // 降级到 TCP 53 兜底
+    } finally {
+        clearTimeout(timer);
+    }
+    let tcpSocket = null;
+    try {
+        tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
+        const tcpFrame = new Uint8Array(2 + dnsQueryBytes.byteLength);
+        tcpFrame[0] = (dnsQueryBytes.byteLength >> 8) & 0xff;
+        tcpFrame[1] = dnsQueryBytes.byteLength & 0xff;
+        tcpFrame.set(dnsQueryBytes, 2);
         const writer = tcpSocket.writable.getWriter();
-        await writer.write(udpChunk);
+        await writer.write(tcpFrame);
         writer.releaseLock();
-        await tcpSocket.readable.pipeTo(new WritableStream({
-            async write(chunk) {
-                if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                    let dataToSend = chunk;
-                    if (vlessHeader) { 
-                        const response = new Uint8Array(vlessHeader.length + chunk.byteLength);
-                        response.set(vlessHeader, 0);
-                        response.set(chunk, vlessHeader.length);
-                        dataToSend = response;
-                        vlessHeader = null; 
-                    }
-                    if (ssInstance) {
-                        const enc = await ssInstance.encData(dataToSend instanceof Uint8Array ? dataToSend : new Uint8Array(dataToSend));
-                        webSocket.send(enc.buffer ? enc.buffer : enc);
-                    } else {
-                        webSocket.send(dataToSend); 
+        const reader = tcpSocket.readable.getReader();
+        let buf = new Uint8Array(0);
+        while (buf.byteLength < 2) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf = cat_ss(buf, value instanceof Uint8Array ? value : new Uint8Array(value));
+        }
+        if (buf.byteLength >= 2) {
+            const expected = 2 + ((buf[0] << 8) | buf[1]);
+            while (buf.byteLength < expected) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf = cat_ss(buf, value instanceof Uint8Array ? value : new Uint8Array(value));
+            }
+            reader.releaseLock();
+            return buf.subarray(2, expected);
+        }
+        reader.releaseLock();
+    } catch (e) {
+    } finally {
+        closeSocketQuietly(tcpSocket);
+    }
+    return null;
+}
+
+async function forwardataudp(udpChunk, webSocket, respHeader, ssInstance) {
+    if (!udpChunk || !udpChunk.byteLength) return;
+    try {
+        const u8 = udpChunk instanceof Uint8Array ? udpChunk : new Uint8Array(udpChunk);
+        let vlessHeader = respHeader;
+        // 判断是否为带 2 字节长度前缀的 VLESS UDP DNS 帧
+        if (!ssInstance && u8.byteLength >= 14) {
+            const firstLen = (u8[0] << 8) | u8[1];
+            if (firstLen >= 12 && firstLen <= u8.byteLength - 2) {
+                let offset = 0;
+                while (offset + 2 <= u8.byteLength) {
+                    const qLen = (u8[offset] << 8) | u8[offset + 1];
+                    if (qLen <= 0 || offset + 2 + qLen > u8.byteLength) break;
+                    const qData = u8.subarray(offset + 2, offset + 2 + qLen);
+                    offset += 2 + qLen;
+                    const ans = await resolveRawDnsWire(qData);
+                    if (ans && webSocket.readyState === WS_READY_STATE_OPEN) {
+                        const hLen = vlessHeader ? vlessHeader.length : 0;
+                        const pkt = new Uint8Array(hLen + 2 + ans.byteLength);
+                        if (vlessHeader) {
+                            pkt.set(vlessHeader, 0);
+                            vlessHeader = null;
+                        }
+                        pkt[hLen] = (ans.byteLength >> 8) & 0xff;
+                        pkt[hLen + 1] = ans.byteLength & 0xff;
+                        pkt.set(ans, hLen + 2);
+                        webSocket.send(pkt);
                     }
                 }
-            },
-        }));
-    } catch (error) {
-        // console.error('UDP forward error:', error);
+                return;
+            }
+        }
+        const ans = await resolveRawDnsWire(u8);
+        if (ans && webSocket.readyState === WS_READY_STATE_OPEN) {
+            let dataToSend = ans;
+            if (vlessHeader) {
+                const combined = new Uint8Array(vlessHeader.length + ans.byteLength);
+                combined.set(vlessHeader, 0);
+                combined.set(ans, vlessHeader.length);
+                dataToSend = combined;
+            }
+            if (ssInstance) {
+                const enc = await ssInstance.encData(dataToSend);
+                webSocket.send(enc.buffer ? enc.buffer : enc);
+            } else {
+                webSocket.send(dataToSend);
+            }
+        }
+    } catch (error) {}
+}
+
+async function forwardTrojanUdpDns(trojanChunk, webSocket) {
+    if (!trojanChunk || !trojanChunk.byteLength) return;
+    try {
+        const u8 = trojanChunk instanceof Uint8Array ? trojanChunk : new Uint8Array(trojanChunk);
+        let offset = 0;
+        while (offset + 8 <= u8.byteLength) {
+            const atyp = u8[offset];
+            let addrPortLen = 0;
+            if (atyp === 1) addrPortLen = 7;
+            else if (atyp === 3) addrPortLen = 4 + u8[offset + 1];
+            else if (atyp === 4) addrPortLen = 19;
+            else break;
+            if (offset + addrPortLen + 4 > u8.byteLength) break;
+            const addrHeader = u8.subarray(offset, offset + addrPortLen);
+            const dstPort = (addrHeader[addrHeader.length - 2] << 8) | addrHeader[addrHeader.length - 1];
+            const payloadLen = (u8[offset + addrPortLen] << 8) | u8[offset + addrPortLen + 1];
+            const payloadStart = offset + addrPortLen + 4;
+            if (payloadStart + payloadLen > u8.byteLength) break;
+            const payload = u8.subarray(payloadStart, payloadStart + payloadLen);
+            offset = payloadStart + payloadLen;
+            if (dstPort === 53 && payload.byteLength >= 12) {
+                const ans = await resolveRawDnsWire(payload);
+                if (ans && webSocket.readyState === WS_READY_STATE_OPEN) {
+                    const respPkt = new Uint8Array(addrHeader.length + 4 + ans.byteLength);
+                    respPkt.set(addrHeader, 0);
+                    respPkt[addrHeader.length] = (ans.byteLength >> 8) & 0xff;
+                    respPkt[addrHeader.length + 1] = ans.byteLength & 0xff;
+                    respPkt[addrHeader.length + 2] = 0x0d;
+                    respPkt[addrHeader.length + 3] = 0x0a;
+                    respPkt.set(ans, addrHeader.length + 4);
+                    webSocket.send(respPkt);
+                }
+            }
+        }
+    } catch (e) {}
+}
+
+// ------------------------- 统一节点生成与原生订阅转换引擎 (Sing-box 1.14 / FlClash / 原版 Clash) -------------------------
+function parseCdnHostPort(cdnItem) {
+    let host = '', port = 443, cdnName = '', cdnItemClean = String(cdnItem).trim();
+    if (cdnItemClean.includes('#')) {
+        const idx = cdnItemClean.indexOf('#');
+        cdnName = cdnItemClean.substring(idx + 1).trim();
+        cdnItemClean = cdnItemClean.substring(0, idx).trim();
     }
+    if (cdnItemClean.startsWith('[') && cdnItemClean.includes(']:')) {
+        const ipv6End = cdnItemClean.indexOf(']:');
+        host = cdnItemClean.substring(0, ipv6End + 1);
+        port = parseInt(cdnItemClean.substring(ipv6End + 2), 10) || 443;
+    } else if (cdnItemClean.startsWith('[') && cdnItemClean.endsWith(']')) {
+        host = cdnItemClean;
+        port = 443;
+    } else if (cdnItemClean.includes(':')) {
+        const parts = cdnItemClean.split(':');
+        host = parts[0];
+        port = parseInt(parts[1], 10) || 443;
+    } else {
+        host = cdnItemClean;
+    }
+    const cleanHost = (host.startsWith('[') && host.endsWith(']')) ? host.slice(1, -1) : host;
+    return { uriHost: host, cleanHost, port, cdnName };
+}
+
+async function buildAllNodes(config, currentDomain, validSSPath) {
+    const vlsHeader = 'v' + 'l' + 'e' + 's' + 's';
+    const troHeader = 't' + 'r' + 'o' + 'j' + 'a' + 'n';
+    const ssHeader = 's' + 's';
+    const resolvedCfip = await resolveCfipList(config.cfip);
+    const multiCdn = resolvedCfip.length > 1;
+
+    const rawLandingList = (Array.isArray(config.landingProxies) && config.landingProxies.length > 0)
+        ? config.landingProxies
+        : (config.landingProxy ? [config.landingProxy] : []);
+    const rawProxyList = (Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0)
+        ? config.proxyIPs
+        : (config.proxyIP ? [config.proxyIP] : []);
+
+    const isLandingMode = rawLandingList.length > 0;
+    const rawActiveList = isLandingMode ? rawLandingList : rawProxyList;
+    const parsedProxies = rawActiveList.map((item, idx) => {
+        let rawItem = String(item).trim();
+        let proxyTag = '';
+        if (rawItem.includes('#')) {
+            const hIdx = rawItem.indexOf('#');
+            proxyTag = rawItem.substring(hIdx + 1).trim();
+            rawItem = rawItem.substring(0, hIdx).trim();
+        }
+        const cleanAddr = rawItem.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+        return { proxyAddr: cleanAddr, proxyTag, index: idx, hasRemark: !!proxyTag };
+    }).filter(p => p.proxyAddr);
+
+    const effectiveProxies = parsedProxies.length > 0 ? parsedProxies : [{ proxyAddr: '', proxyTag: '', index: 0, hasRemark: false }];
+    const needIndexRouting = parsedProxies.length > 1 || (parsedProxies.length === 1 && parsedProxies[0].hasRemark);
+    const prefix = isLandingMode ? 'ld' : 'fd';
+    const usedNames = new Set();
+
+    function makeUniqueName(protoLabel, proxy, cdnName, cleanHost) {
+        let base = '';
+        if (proxy.hasRemark && cdnName) {
+            base = `${protoLabel}-${proxy.proxyTag}-${cdnName}`;
+        } else if (proxy.hasRemark) {
+            base = multiCdn ? `${protoLabel}-${proxy.proxyTag}-${cleanHost}` : `${protoLabel}-${proxy.proxyTag}`;
+        } else if (cdnName) {
+            base = `${cdnName}-${protoLabel}`;
+        } else {
+            base = multiCdn ? `${protoLabel}-${cleanHost}` : `Workers-${protoLabel}`;
+        }
+        let candidate = base;
+        let seq = 2;
+        while (usedNames.has(candidate)) {
+            candidate = `${base} #${seq++}`;
+        }
+        usedNames.add(candidate);
+        return candidate;
+    }
+
+    const nodes = [];
+
+    if (!config.disablevless) {
+        for (const cdnItem of resolvedCfip) {
+            const { uriHost, cleanHost, port, cdnName } = parseCdnHostPort(cdnItem);
+            if (!cleanHost) continue;
+            for (const proxy of effectiveProxies) {
+                const name = makeUniqueName('VLESS', proxy, cdnName, cleanHost);
+                const hasIdx = proxy.proxyAddr && needIndexRouting;
+                const wsPath = hasIdx ? `/?ed=2560&${prefix}=${proxy.index}` : '/?ed=2560';
+                const cleanWsPath = hasIdx ? `/?${prefix}=${proxy.index}` : '/';
+                const uri = `${vlsHeader}://${config.yourUUID}@${uriHost}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}#${encodeURIComponent(name)}`;
+                nodes.push({ protocol: 'vless', name, cleanHost, uriHost, port, uuid: config.yourUUID, tls: true, sni: currentDomain, wsHost: currentDomain, wsPath, cleanWsPath, uri });
+            }
+        }
+    }
+
+    if (!config.disabletro) {
+        for (const cdnItem of resolvedCfip) {
+            const { uriHost, cleanHost, port, cdnName } = parseCdnHostPort(cdnItem);
+            if (!cleanHost) continue;
+            for (const proxy of effectiveProxies) {
+                const name = makeUniqueName('Trojan', proxy, cdnName, cleanHost);
+                const hasIdx = proxy.proxyAddr && needIndexRouting;
+                const wsPath = hasIdx ? `/?ed=2560&${prefix}=${proxy.index}` : '/?ed=2560';
+                const cleanWsPath = hasIdx ? `/?${prefix}=${proxy.index}` : '/';
+                const uri = `${troHeader}://${config.yourUUID}@${uriHost}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=${encodeURIComponent(wsPath)}&wspath=${encodeURIComponent(wsPath)}#${encodeURIComponent(name)}`;
+                nodes.push({ protocol: 'trojan', name, cleanHost, uriHost, port, password: config.yourUUID, tls: true, sni: currentDomain, wsHost: currentDomain, wsPath, cleanWsPath, uri });
+            }
+        }
+    }
+
+    if (!config.disabless) {
+        const method = config.ssMethod || 'aes-256-gcm';
+        const methodInfo = C_SS[method] || C_SS['aes-256-gcm'];
+        const rawSecret = config.ssPsk || config.password || config.yourUUID;
+        const effectivePassword = methodInfo.b3 ? await deriveSS_Psk(rawSecret, methodInfo.k) : rawSecret;
+        const encodedConfig = btoa(`${method}:${effectivePassword}`);
+        for (const cdnItem of resolvedCfip) {
+            const { uriHost, cleanHost, port, cdnName } = parseCdnHostPort(cdnItem);
+            if (!cleanHost) continue;
+            const isHttpPort = [80, 8080, 8880, 2052, 2082, 2086, 2095].includes(port);
+            for (const proxy of effectiveProxies) {
+                const name = makeUniqueName('SS', proxy, cdnName, cleanHost);
+                const hasIdx = proxy.proxyAddr && needIndexRouting;
+                const ssWsPath = hasIdx ? `${validSSPath}/?ed=2560&${prefix}=${proxy.index}` : `${validSSPath}/?ed=2560`;
+                const pluginParam = isHttpPort
+                    ? `plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${encodeURIComponent(ssWsPath)};mux%3D0`
+                    : `plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${encodeURIComponent(ssWsPath)};tls;sni%3D${currentDomain};skip-cert-verify%3Dtrue;mux%3D0`;
+                const uri = `${ssHeader}://${encodedConfig}@${uriHost}:${port}?${pluginParam}#${encodeURIComponent(name)}`;
+                nodes.push({ protocol: 'ss', name, cleanHost, uriHost, port, cipher: method, password: effectivePassword, isSS2022: !!methodInfo.b3, tls: !isHttpPort, sni: currentDomain, wsHost: currentDomain, wsPath: ssWsPath, uri });
+            }
+        }
+    }
+
+    return nodes;
+}
+
+function generateSingboxConfig(nodes) {
+    const proxyOutbounds = [];
+    for (const n of nodes) {
+        if (n.protocol === 'vless') {
+            proxyOutbounds.push({
+                type: 'vless',
+                tag: n.name,
+                server: n.cleanHost,
+                server_port: n.port,
+                uuid: n.uuid,
+                tls: { enabled: true, server_name: n.sni, insecure: false, utls: { enabled: true, fingerprint: 'firefox' } },
+                transport: { type: 'ws', path: n.cleanWsPath, headers: { Host: n.wsHost }, max_early_data: 2560, early_data_header_name: 'Sec-WebSocket-Protocol' }
+            });
+        } else if (n.protocol === 'trojan') {
+            proxyOutbounds.push({
+                type: 'trojan',
+                tag: n.name,
+                server: n.cleanHost,
+                server_port: n.port,
+                password: n.password,
+                tls: { enabled: true, server_name: n.sni, insecure: false, utls: { enabled: true, fingerprint: 'firefox' } },
+                transport: { type: 'ws', path: n.cleanWsPath, headers: { Host: n.wsHost } }
+            });
+        } else if (n.protocol === 'ss') {
+            proxyOutbounds.push({
+                type: 'shadowsocks',
+                tag: n.name,
+                server: n.cleanHost,
+                server_port: n.port,
+                method: n.cipher,
+                password: n.password,
+                plugin: 'v2ray-plugin',
+                plugin_opts: n.tls
+                    ? `tls;mode=websocket;host=${n.wsHost};path=${n.wsPath};mux=0`
+                    : `mode=websocket;host=${n.wsHost};path=${n.wsPath};mux=0`
+            });
+        }
+    }
+    const nodeTags = proxyOutbounds.map(o => o.tag);
+    const hasNodes = nodeTags.length > 0;
+    const selectorGroup = {
+        type: 'selector',
+        tag: '🚀 节点选择',
+        outbounds: hasNodes ? ['⚡ 自动选择', ...nodeTags, 'direct'] : ['direct'],
+        default: hasNodes ? '⚡ 自动选择' : 'direct'
+    };
+    const outbounds = [selectorGroup];
+    if (hasNodes) {
+        outbounds.push({
+            type: 'urltest',
+            tag: '⚡ 自动选择',
+            outbounds: [...nodeTags],
+            url: 'https://www.gstatic.com/generate_204',
+            interval: '5m',
+            tolerance: 50
+        });
+    }
+    outbounds.push(...proxyOutbounds, { type: 'direct', tag: 'direct' });
+
+    // 严格遵循 Sing-box 1.14+ 最新架构规范 (新版 dns.servers / 顶层 http_clients / default_domain_resolver / route action)
+    return {
+        log: { level: 'info', timestamp: true },
+        http_clients: [{ tag: 'proxy-http', detour: '🚀 节点选择' }],
+        dns: {
+            servers: [
+                { tag: 'dns-local', type: 'udp', server: '223.5.5.5', server_port: 53 },
+                { tag: 'dns-remote', type: 'https', server: '1.1.1.1', server_port: 443, path: '/dns-query', detour: '🚀 节点选择' }
+            ],
+            rules: [
+                { rule_set: 'geosite-cn', server: 'dns-local' }
+            ],
+            final: 'dns-remote',
+            strategy: 'prefer_ipv4'
+        },
+        inbounds: [
+            {
+                type: 'tun',
+                tag: 'tun-in',
+                address: ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
+                auto_route: true,
+                strict_route: false
+            },
+            {
+                type: 'mixed',
+                tag: 'mixed-in',
+                listen: '127.0.0.1',
+                listen_port: 2080
+            }
+        ],
+        outbounds,
+        route: {
+            default_domain_resolver: 'dns-local',
+            default_http_client: 'proxy-http',
+            auto_detect_interface: true,
+            rules: [
+                { action: 'sniff' },
+                { protocol: 'dns', action: 'hijack-dns' },
+                { ip_is_private: true, outbound: 'direct' },
+                { rule_set: 'geosite-ads', action: 'reject' },
+                { rule_set: ['geosite-cn', 'geoip-cn'], outbound: 'direct' }
+            ],
+            rule_set: [
+                { tag: 'geosite-ads', type: 'remote', format: 'binary', url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs' },
+                { tag: 'geosite-cn', type: 'remote', format: 'binary', url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs' },
+                { tag: 'geoip-cn', type: 'remote', format: 'binary', url: 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs' }
+            ],
+            final: '🚀 节点选择'
+        }
+    };
+}
+
+const CLASSIC_CLASH_SS_CIPHERS = new Set([
+    'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
+    'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+    'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
+    'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr', 'rc4-md5'
+]);
+
+function generateClashConfig(nodes, isMeta = true) {
+    const clashProxies = [];
+    for (const n of nodes) {
+        if (n.protocol === 'vless') {
+            if (!isMeta) continue; // 原版 Clash 不支持 VLESS，自动过滤避免整份配置报错
+            clashProxies.push({
+                name: n.name,
+                type: 'vless',
+                server: n.cleanHost,
+                port: n.port,
+                uuid: n.uuid,
+                udp: true,
+                tls: true,
+                'skip-cert-verify': false,
+                servername: n.sni,
+                'client-fingerprint': 'firefox',
+                network: 'ws',
+                'ws-opts': {
+                    path: n.cleanWsPath,
+                    headers: { Host: n.wsHost },
+                    'max-early-data': 2560,
+                    'early-data-header-name': 'Sec-WebSocket-Protocol'
+                }
+            });
+        } else if (n.protocol === 'trojan') {
+            const p = {
+                name: n.name,
+                type: 'trojan',
+                server: n.cleanHost,
+                port: n.port,
+                password: n.password,
+                udp: true,
+                sni: n.sni,
+                'skip-cert-verify': false,
+                network: 'ws',
+                'ws-opts': {
+                    path: n.cleanWsPath,
+                    headers: { Host: n.wsHost }
+                }
+            };
+            if (isMeta) p['client-fingerprint'] = 'firefox';
+            clashProxies.push(p);
+        } else if (n.protocol === 'ss') {
+            if (!isMeta && !CLASSIC_CLASH_SS_CIPHERS.has(n.cipher)) continue;
+            clashProxies.push({
+                name: n.name,
+                type: 'ss',
+                server: n.cleanHost,
+                port: n.port,
+                cipher: n.cipher,
+                password: n.password,
+                udp: true,
+                plugin: 'v2ray-plugin',
+                'plugin-opts': {
+                    mode: 'websocket',
+                    tls: n.tls,
+                    'skip-cert-verify': false,
+                    host: n.wsHost,
+                    path: n.wsPath,
+                    mux: false
+                }
+            });
+        }
+    }
+
+    const proxyNames = clashProxies.map(p => p.name);
+    const hasProxies = proxyNames.length > 0;
+    const groupMembers = hasProxies ? proxyNames : ['DIRECT'];
+    const selectMembers = hasProxies ? ['⚡ 自动选择', '🔯 故障转移', ...proxyNames, 'DIRECT'] : ['DIRECT'];
+
+    const lines = [
+        `# Generated by Cloudflare Workers (${isMeta ? 'Mihomo / FlClash Full Mode' : 'Classic Clash Compatible Mode'})`,
+        'mixed-port: 7890',
+        'allow-lan: true',
+        'bind-address: "*"',
+        'mode: rule',
+        'log-level: info',
+        'ipv6: true',
+        'external-controller: 127.0.0.1:9090',
+        'dns:',
+        '  enable: true',
+        '  ipv6: false',
+        '  enhanced-mode: fake-ip',
+        '  fake-ip-range: 198.18.0.1/16',
+        '  fake-ip-filter:',
+        '    - "*.lan"',
+        '    - "+.msftconnecttest.com"',
+        '    - "+.msftncsi.com"',
+        '    - "localhost.ptlogin2.qq.com"',
+        '  default-nameserver:',
+        '    - 223.5.5.5',
+        '    - 119.29.29.29',
+        '  nameserver:',
+        '    - https://dns.alidns.com/dns-query',
+        '    - https://doh.pub/dns-query',
+        'proxies:'
+    ];
+    if (!hasProxies) {
+        lines[lines.length - 1] = 'proxies: []';
+    } else {
+        for (const p of clashProxies) {
+            lines.push(`  - ${JSON.stringify(p)}`);
+        }
+    }
+
+    lines.push('proxy-groups:');
+    lines.push(`  - ${JSON.stringify({ name: '🚀 节点选择', type: 'select', proxies: selectMembers })}`);
+    if (hasProxies) {
+        lines.push(`  - ${JSON.stringify({ name: '⚡ 自动选择', type: 'url-test', proxies: groupMembers, url: 'https://www.gstatic.com/generate_204', interval: 300, tolerance: 50 })}`);
+        lines.push(`  - ${JSON.stringify({ name: '🔯 故障转移', type: 'fallback', proxies: groupMembers, url: 'https://www.gstatic.com/generate_204', interval: 300 })}`);
+    }
+    lines.push(`  - ${JSON.stringify({ name: '🎯 全球直连', type: 'select', proxies: ['DIRECT', '🚀 节点选择'] })}`);
+    lines.push(`  - ${JSON.stringify({ name: '🛑 广告拦截', type: 'select', proxies: ['REJECT', 'DIRECT'] })}`);
+    lines.push(`  - ${JSON.stringify({ name: '🐟 漏网之鱼', type: 'select', proxies: ['🚀 节点选择', '🎯 全球直连'] })}`);
+
+    // 100% 同时兼容原版 Clash 与 FlClash/Mihomo 的高速内置分流规则 (不含会导致原版 Clash 报错的 GEOSITE)
+    const rules = [
+        'DOMAIN-SUFFIX,local,🎯 全球直连',
+        'IP-CIDR,127.0.0.0/8,🎯 全球直连,no-resolve',
+        'IP-CIDR,10.0.0.0/8,🎯 全球直连,no-resolve',
+        'IP-CIDR,172.16.0.0/12,🎯 全球直连,no-resolve',
+        'IP-CIDR,192.168.0.0/16,🎯 全球直连,no-resolve',
+        'IP-CIDR,100.64.0.0/10,🎯 全球直连,no-resolve',
+        'DOMAIN-KEYWORD,adservice,🛑 广告拦截',
+        'DOMAIN-SUFFIX,doubleclick.net,🛑 广告拦截',
+        'DOMAIN-SUFFIX,googlesyndication.com,🛑 广告拦截',
+        'DOMAIN-SUFFIX,googleadservices.com,🛑 广告拦截',
+        'DOMAIN-SUFFIX,app-measurement.com,🛑 广告拦截',
+        'DOMAIN-SUFFIX,cn,🎯 全球直连',
+        'DOMAIN-KEYWORD,-cn,🎯 全球直连',
+        'DOMAIN-SUFFIX,baidu.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,bdstatic.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,qq.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,wechat.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,weixin.qq.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,gtimg.cn,🎯 全球直连',
+        'DOMAIN-SUFFIX,myqcloud.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,taobao.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,tmall.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,alicdn.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,aliyun.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,alipay.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,jd.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,360buyimg.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,bilibili.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,bilivideo.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,hdslb.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,163.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,126.net,🎯 全球直连',
+        'DOMAIN-SUFFIX,bytedance.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,douyin.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,toutiao.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,weibo.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,zhihu.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,xiaohongshu.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,meituan.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,mi.com,🎯 全球直连',
+        'DOMAIN-SUFFIX,icloud.com.cn,🎯 全球直连',
+        'DOMAIN-SUFFIX,apple.com.cn,🎯 全球直连',
+        'DOMAIN-SUFFIX,google.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,googleapis.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,gstatic.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,youtube.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,ytimg.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,googlevideo.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,github.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,githubusercontent.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,openai.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,chatgpt.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,anthropic.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,claude.ai,🚀 节点选择',
+        'DOMAIN-SUFFIX,x.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,twitter.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,twimg.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,telegram.org,🚀 节点选择',
+        'DOMAIN-SUFFIX,t.me,🚀 节点选择',
+        'DOMAIN-SUFFIX,netflix.com,🚀 节点选择',
+        'DOMAIN-SUFFIX,nflxvideo.net,🚀 节点选择',
+        'DOMAIN-SUFFIX,wikipedia.org,🚀 节点选择',
+        'IP-CIDR,91.108.4.0/22,🚀 节点选择,no-resolve',
+        'IP-CIDR,91.108.8.0/21,🚀 节点选择,no-resolve',
+        'IP-CIDR,91.108.16.0/21,🚀 节点选择,no-resolve',
+        'IP-CIDR,91.108.56.0/22,🚀 节点选择,no-resolve',
+        'IP-CIDR,149.154.160.0/20,🚀 节点选择,no-resolve',
+        'GEOIP,CN,🎯 全球直连',
+        'MATCH,🐟 漏网之鱼'
+    ];
+    lines.push('rules:');
+    for (const r of rules) lines.push(`  - ${r}`);
+    return lines.join('\n') + '\n';
 }
 
 /**
@@ -3171,13 +3675,141 @@ async function buildQxSsConfig(url, validSSPath, config) {
     return `shadowsocks=${qxHostPort},method=${method},password=${effectivePwd},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=Workers-SS`;
 }
 
+function getCamouflageProbePage(url, showError = false, autoOpenLogin = false, setCookie = null) {
+    const showModal = showError || autoOpenLogin;
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edge Cloud Status - Global Telemetry</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b1120; color: #e2e8f0; min-height: 100vh; padding: 32px 16px; }
+        .wrap { max-width: 860px; margin: 0 auto; }
+        .top-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding-bottom: 22px; border-bottom: 1px solid #1e293b; margin-bottom: 24px; }
+        .brand { display: flex; align-items: center; gap: 12px; user-select: none; cursor: default; }
+        .brand-dot { width: 12px; height: 12px; border-radius: 50%; background: #10b981; box-shadow: 0 0 12px #10b981; }
+        .brand h1 { font-size: 1.25rem; font-weight: 700; color: #f8fafc; letter-spacing: 0.3px; }
+        .badge-ok { background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.35); color: #34d399; padding: 6px 14px; border-radius: 999px; font-size: 0.82rem; font-weight: 600; user-select: none; cursor: pointer; }
+        .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 24px; }
+        .m-card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 16px; }
+        .m-label { font-size: 0.78rem; color: #94a3b8; margin-bottom: 6px; }
+        .m-val { font-size: 1.45rem; font-weight: 700; color: #f1f5f9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+        .m-sub { font-size: 0.75rem; color: #10b981; margin-top: 4px; }
+        .panel { background: #111827; border: 1px solid #1f2937; border-radius: 14px; padding: 20px; margin-bottom: 20px; }
+        .panel-title { font-size: 0.92rem; font-weight: 600; color: #cbd5e1; margin-bottom: 14px; display: flex; justify-content: space-between; }
+        .node-row { display: flex; justify-content: space-between; align-items: center; padding: 11px 0; border-bottom: 1px solid #1e293b; font-size: 0.88rem; }
+        .node-row:last-child { border-bottom: none; }
+        .region { display: flex; align-items: center; gap: 10px; color: #e2e8f0; font-weight: 500; }
+        .bars { display: flex; gap: 3px; align-items: center; }
+        .bar { width: 4px; height: 16px; border-radius: 2px; background: #10b981; opacity: 0.88; }
+        .ping { font-family: monospace; color: #94a3b8; font-size: 0.82rem; min-width: 58px; text-align: right; }
+        .foot { text-align: center; color: #475569; font-size: 0.78rem; margin-top: 28px; }
+        .modal-mask { position: fixed; inset: 0; background: rgba(2, 6, 23, 0.78); backdrop-filter: blur(6px); display: ${showModal ? 'flex' : 'none'}; align-items: center; justify-content: center; z-index: 999; padding: 16px; }
+        .modal-box { background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 28px 24px; width: 100%; max-width: 380px; box-shadow: 0 25px 50px rgba(0,0,0,0.5); }
+        .modal-box h3 { font-size: 1.1rem; color: #f8fafc; margin-bottom: 6px; }
+        .modal-box p { font-size: 0.82rem; color: #94a3b8; margin-bottom: 18px; }
+        .err-tip { background: rgba(239, 68, 68, 0.15); border-left: 3px solid #ef4444; color: #fca5a5; padding: 9px 12px; border-radius: 6px; font-size: 0.82rem; margin-bottom: 14px; }
+        .inp { width: 100%; padding: 11px 14px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #f8fafc; font-size: 0.95rem; margin-bottom: 14px; }
+        .inp:focus { outline: none; border-color: #38bdf8; }
+        .btn-row { display: flex; gap: 10px; }
+        .btn-sub { flex: 1; padding: 10px; background: linear-gradient(135deg, #0ea5e9, #6366f1); color: #fff; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
+        .btn-cancel { padding: 10px 16px; background: #334155; color: #cbd5e1; border: none; border-radius: 8px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="top-bar">
+            <div class="brand" id="probe-brand">
+                <span class="brand-dot"></span>
+                <h1>Edge Cloud Telemetry</h1>
+            </div>
+            <div class="badge-ok" id="probe-trigger" title="System Status">● All Systems Operational</div>
+        </div>
+        <div class="metrics">
+            <div class="m-card"><div class="m-label">Edge Uptime (30d)</div><div class="m-val">99.99%</div><div class="m-sub">SLA Verified</div></div>
+            <div class="m-card"><div class="m-label">Global Anycast RTT</div><div class="m-val" id="m-rtt">18.4 ms</div><div class="m-sub">Optimal Routing</div></div>
+            <div class="m-card"><div class="m-label">Worker Memory</div><div class="m-val" id="m-mem">14.2 MB</div><div class="m-sub">128 MB Quota</div></div>
+            <div class="m-card"><div class="m-label">TLS 1.3 Handshake</div><div class="m-val">0-RTT</div><div class="m-sub">Active</div></div>
+        </div>
+        <div class="panel">
+            <div class="panel-title"><span>Regional Edge PoPs (${escHtml(url)})</span><span>90-Day Availability</span></div>
+            <div class="node-row"><span class="region">🟢 Asia Pacific — Tokyo (NRT)</span><div class="bars">${'<span class="bar"></span>'.repeat(18)}</div><span class="ping">24 ms</span></div>
+            <div class="node-row"><span class="region">🟢 Asia Pacific — Hong Kong (HKG)</span><div class="bars">${'<span class="bar"></span>'.repeat(18)}</div><span class="ping">15 ms</span></div>
+            <div class="node-row"><span class="region">🟢 Asia Pacific — Singapore (SIN)</span><div class="bars">${'<span class="bar"></span>'.repeat(18)}</div><span class="ping">36 ms</span></div>
+            <div class="node-row"><span class="region">🟢 North America — San Jose (SJC)</span><div class="bars">${'<span class="bar"></span>'.repeat(18)}</div><span class="ping">118 ms</span></div>
+            <div class="node-row"><span class="region">🟢 Europe — Frankfurt (FRA)</span><div class="bars">${'<span class="bar"></span>'.repeat(18)}</div><span class="ping">152 ms</span></div>
+        </div>
+        <div class="foot">Powered by Edge Telemetry Engine &bull; Updated just now</div>
+    </div>
+
+    <div class="modal-mask" id="auth-modal" onclick="if(event.target===this)closeAuth()">
+        <div class="modal-box">
+            <h3>Node Access Console</h3>
+            <p>Enter access token to view node metrics &amp; endpoints.</p>
+            ${showError ? '<div class="err-tip">Access token invalid, please try again.</div>' : ''}
+            <form onsubmit="submitAuth(event)">
+                <input type="password" id="auth-pwd" class="inp" placeholder="Access Token" required>
+                <div class="btn-row">
+                    <button type="button" class="btn-cancel" onclick="closeAuth()">Cancel</button>
+                    <button type="submit" class="btn-sub">Verify</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        if (window.location.search.includes("logout=") || window.location.search.includes("password=") || window.location.search.includes("login=")) {
+            const u = new URL(window.location);
+            u.searchParams.delete("logout"); u.searchParams.delete("password"); u.searchParams.delete("login");
+            window.history.replaceState({}, "", u.pathname + u.search);
+        }
+        function openAuth() {
+            document.getElementById("auth-modal").style.display = "flex";
+            setTimeout(() => document.getElementById("auth-pwd").focus(), 50);
+        }
+        function closeAuth() { document.getElementById("auth-modal").style.display = "none"; }
+        function submitAuth(e) {
+            e.preventDefault();
+            const pwd = document.getElementById("auth-pwd").value;
+            const u = new URL(window.location);
+            u.searchParams.set("password", pwd);
+            window.location.href = u.toString();
+        }
+        let tapCnt = 0, tapTimer = 0;
+        function handleSecretTap() {
+            tapCnt++;
+            clearTimeout(tapTimer);
+            if (tapCnt >= 2) { tapCnt = 0; openAuth(); }
+            else { tapTimer = setTimeout(() => { tapCnt = 0; }, 600); }
+        }
+        document.getElementById("probe-trigger").addEventListener("click", handleSecretTap);
+        document.getElementById("probe-brand").addEventListener("dblclick", openAuth);
+        setInterval(() => {
+            const rtt = (17 + Math.random() * 3.5).toFixed(1);
+            const el = document.getElementById("m-rtt");
+            if (el) el.textContent = rtt + " ms";
+        }, 3500);
+    </script>
+</body>
+</html>`;
+    const respHeaders = {
+        'Content-Type': 'text/html;charset=utf-8',
+        'Cache-Control': 'no-cache, no-store, must-revalidate'
+    };
+    if (setCookie) respHeaders['Set-Cookie'] = setCookie;
+    return new Response(html, { status: 200, headers: respHeaders });
+}
+
 async function getNodesPage(request, validSSPath, config, hasKV) {
 	const url = request.headers.get('Host') || new URL(request.url).host;
 	const baseUrl = `https://${url}`;
 	const urlObj = new URL(request.url);
 	const secureFlag = urlObj.protocol === 'https:' ? '; Secure' : '';
+	const wantLoginModal = urlObj.searchParams.has('login');
 	if (urlObj.searchParams.get('logout') === '1') {
-		return getLoginPage(url, baseUrl, false, false, `cf_user_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`);
+		return getCamouflageProbePage(url, false, false, `cf_user_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`);
 	}
 	const providedPassword = urlObj.searchParams.get('password');
 	if (providedPassword !== null) {
@@ -3185,14 +3817,14 @@ async function getNodesPage(request, validSSPath, config, hasKV) {
 			const setCookie = `cf_user_pwd=${encodeURIComponent(providedPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`;
 			return await getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie);
 		} else {
-			return getLoginPage(url, baseUrl, true, false);
+			return getCamouflageProbePage(url, true, true);
 		}
 	}
 	const cookiePassword = getCookieValue(request.headers.get('Cookie'), 'cf_user_pwd');
 	if (cookiePassword && cookiePassword === config.password) {
 		return await getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, null);
 	}
-	return getLoginPage(url, baseUrl, false, false);
+	return getCamouflageProbePage(url, false, wantLoginModal);
 }
 
 /**
@@ -3450,22 +4082,118 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false, setCooki
  * @returns {Response}
  */
 function formatSubconverterUrl(prefix, target, rawUrl) {
+    const cleanPrefix = (prefix || '').trim();
+    if (!cleanPrefix) {
+        return `${rawUrl}?target=${target}`;
+    }
     const encodedRaw = encodeURIComponent(rawUrl);
-    if (!prefix) {
-        return `https://subapi.194216.xyz/sub?target=${target}&url=${encodedRaw}&insert=false`;
-    }
-    if (prefix.includes('url=')) {
-        if (prefix.endsWith('=') || prefix.endsWith('&')) {
-            return `${prefix}${encodedRaw}`;
+    if (cleanPrefix.includes('url=')) {
+        if (cleanPrefix.endsWith('=') || cleanPrefix.endsWith('&')) {
+            return `${cleanPrefix}${encodedRaw}`;
         }
-        return `${prefix}&url=${encodedRaw}`;
+        return `${cleanPrefix}&url=${encodedRaw}`;
     }
-    if (prefix.includes('target=')) {
-        const joinChar = prefix.includes('?') ? (prefix.endsWith('?') || prefix.endsWith('&') ? '' : '&') : '?';
-        return `${prefix}${joinChar}url=${encodedRaw}`;
+    if (cleanPrefix.includes('target=')) {
+        const joinChar = cleanPrefix.includes('?') ? (cleanPrefix.endsWith('?') || cleanPrefix.endsWith('&') ? '' : '&') : '?';
+        return `${cleanPrefix}${joinChar}url=${encodedRaw}`;
     }
-    const cleanPrefix = prefix.replace(/\/+$/, '');
-    return `${cleanPrefix}/sub?target=${target}&url=${encodedRaw}&insert=false`;
+    return `${cleanPrefix.replace(/\/+$/, '')}/sub?target=${target}&url=${encodedRaw}&insert=false`;
+}
+
+function renderNodeListAndQrWidget(nodes, clashFullUrl, singboxFullUrl, rawSubUrl) {
+    const itemsHtml = nodes.map((n, idx) => {
+        const badgeColor = n.protocol === 'vless' ? '#4f46e5' : (n.protocol === 'trojan' ? '#0ea5e9' : '#10b981');
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid #e2e8f0;gap:8px;font-size:0.85rem;">
+            <div style="display:flex;align-items:center;gap:8px;min-width:0;text-align:left;">
+                <span style="background:${badgeColor};color:#fff;font-size:0.7rem;font-weight:700;padding:2px 6px;border-radius:5px;text-transform:uppercase;flex-shrink:0;">${escHtml(n.protocol)}</span>
+                <span style="color:#1e293b;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(n.name)}</span>
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0;">
+                <button type="button" onclick="copyNodeByIdx(${idx})" style="padding:4px 10px;border:1px solid #cbd5e1;background:#fff;color:#334155;border-radius:6px;cursor:pointer;font-size:0.78rem;font-weight:600;"><i class="fas fa-copy"></i> 复制</button>
+                <button type="button" onclick="qrNodeByIdx(${idx})" style="padding:4px 10px;border:1px solid #c7d2fe;background:#eef2ff;color:#4f46e5;border-radius:6px;cursor:pointer;font-size:0.78rem;font-weight:600;"><i class="fas fa-qrcode"></i> 二维码</button>
+            </div>
+        </div>`;
+    }).join('');
+
+    const htmlBlock = `
+        <div style="margin:6px 0 12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+            <button type="button" onclick="qrSub('singbox')" style="padding:6px 12px;border:1px solid #cbd5e1;background:#f8fafc;color:#334155;border-radius:8px;cursor:pointer;font-size:0.8rem;font-weight:600;"><i class="fas fa-qrcode"></i> Sing-box 订阅码</button>
+            <button type="button" onclick="qrSub('clash')" style="padding:6px 12px;border:1px solid #cbd5e1;background:#f8fafc;color:#334155;border-radius:8px;cursor:pointer;font-size:0.8rem;font-weight:600;"><i class="fas fa-qrcode"></i> Clash 订阅码</button>
+            <button type="button" onclick="qrSub('raw')" style="padding:6px 12px;border:1px solid #cbd5e1;background:#f8fafc;color:#334155;border-radius:8px;cursor:pointer;font-size:0.8rem;font-weight:600;"><i class="fas fa-qrcode"></i> 通用订阅码</button>
+        </div>
+        <details style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;margin:8px 0 12px;text-align:left;overflow:hidden;">
+            <summary style="padding:11px 16px;cursor:pointer;font-weight:600;font-size:0.9rem;color:#334155;user-select:none;display:flex;justify-content:space-between;align-items:center;">
+                <span><i class="fas fa-list-ul" style="color:#4f46e5;margin-right:6px;"></i>展开单节点列表与扫码导入 (共 ${nodes.length} 个节点)</span>
+                <span style="font-size:0.78rem;color:#64748b;">点击展开/收起</span>
+            </summary>
+            <div style="max-height:280px;overflow-y:auto;border-top:1px solid #e2e8f0;background:#fff;">
+                ${itemsHtml || '<div style="padding:16px;text-align:center;color:#94a3b8;font-size:0.85rem;">当前未启用任何协议节点</div>'}
+            </div>
+        </details>
+        <div id="qr-modal-mask" onclick="if(event.target===this)closeQrModal()" style="position:fixed;inset:0;background:rgba(15,23,42,0.65);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:2000;padding:16px;">
+            <div style="background:#fff;border-radius:16px;padding:22px;max-width:340px;width:100%;text-align:center;box-shadow:0 20px 40px rgba(0,0,0,0.25);">
+                <div id="qr-modal-title" style="font-weight:700;font-size:0.95rem;color:#1e293b;margin-bottom:12px;word-break:break-all;">二维码</div>
+                <div id="qr-modal-box" style="display:flex;align-items:center;justify-content:center;min-height:210px;background:#f8fafc;border-radius:12px;padding:12px;margin-bottom:14px;"></div>
+                <div style="display:flex;gap:8px;justify-content:center;">
+                    <button type="button" id="qr-copy-btn" style="flex:1;padding:9px 14px;background:#4f46e5;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:0.85rem;"><i class="fas fa-copy"></i> 复制内容</button>
+                    <button type="button" onclick="closeQrModal()" style="padding:9px 16px;background:#e2e8f0;color:#334155;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:0.85rem;">关闭</button>
+                </div>
+            </div>
+        </div>`;
+
+    const jsBlock = `
+        const __SUB_QR_MAP__ = ${JSON.stringify({ singbox: ['Sing-box 1.14+ 订阅二维码', singboxFullUrl], clash: ['Clash 订阅二维码 (自适应 FlClash/原版)', clashFullUrl], raw: ['通用全协议订阅二维码', rawSubUrl] }).replace(/<\//g, '<\\/')};
+        const __NODE_LIST__ = ${JSON.stringify(nodes.map(n => ({ name: n.name, uri: n.uri }))).replace(/<\//g, '<\\/')};
+        function qrSub(k) { const v = __SUB_QR_MAP__[k]; if (v) showQrModal(v[0], v[1]); }
+        function copyNodeByIdx(i) {
+            const item = __NODE_LIST__[i];
+            if (item) copyText(item.uri, "已复制节点: " + item.name);
+        }
+        function qrNodeByIdx(i) {
+            const item = __NODE_LIST__[i];
+            if (item) showQrModal(item.name, item.uri);
+        }
+        function renderQrSvg(text) {
+            if (typeof qrcode === "function") {
+                const qr = qrcode(0, "M");
+                qr.addData(text);
+                qr.make();
+                return qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+            }
+            return null;
+        }
+        function showQrModal(title, text) {
+            const mask = document.getElementById("qr-modal-mask");
+            const titleEl = document.getElementById("qr-modal-title");
+            const box = document.getElementById("qr-modal-box");
+            const copyBtn = document.getElementById("qr-copy-btn");
+            titleEl.textContent = title;
+            copyBtn.onclick = function() { copyText(text, "内容已复制到剪贴板!"); };
+            mask.style.display = "flex";
+            const svg = renderQrSvg(text);
+            if (svg) {
+                box.innerHTML = svg;
+                const svgEl = box.querySelector("svg");
+                if (svgEl) { svgEl.style.width = "200px"; svgEl.style.height = "200px"; }
+            } else {
+                box.innerHTML = '<span style="color:#64748b;font-size:0.85rem;">正在加载本地二维码引擎...</span>';
+                const s = document.createElement("script");
+                s.src = "https://unpkg.com/qrcode-generator@1.4.4/qrcode.js";
+                s.onload = function() {
+                    const retrySvg = renderQrSvg(text);
+                    if (retrySvg) {
+                        box.innerHTML = retrySvg;
+                        const svgEl = box.querySelector("svg");
+                        if (svgEl) { svgEl.style.width = "200px"; svgEl.style.height = "200px"; }
+                    }
+                };
+                s.onerror = function() { box.innerHTML = '<span style="color:#ef4444;font-size:0.82rem;">离线环境无法渲染图形，请点击下方复制按钮</span>'; };
+                document.head.appendChild(s);
+            }
+        }
+        function closeQrModal() { document.getElementById("qr-modal-mask").style.display = "none"; }`;
+
+    return { htmlBlock, jsBlock };
 }
 
 async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie = null) {
@@ -3473,6 +4201,9 @@ async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, set
     const clashFullUrl = formatSubconverterUrl(config.clashSubUrl, 'clash', rawSubUrl);
     const singboxFullUrl = formatSubconverterUrl(config.singboxSubUrl, 'singbox', rawSubUrl);
     const qxFullConfig = await buildQxSsConfig(url, validSSPath, config);
+    const currentDomain = url.split(':')[0];
+    const previewNodes = await buildAllNodes(config, currentDomain, validSSPath);
+    const qrWidget = renderNodeListAndQrWidget(previewNodes, clashFullUrl, singboxFullUrl, rawSubUrl);
 
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -3481,6 +4212,7 @@ async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, set
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Workers Service - 节点与订阅</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -3831,7 +4563,7 @@ async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, set
                 <i class="fas fa-paper-plane"></i> 复制 Quantumult X 配置
             </button>
         </div>
-        
+        ${qrWidget.htmlBlock}
         <div class="footer">
             <div>
                 <a href="/admin" class="admin-link">
@@ -3918,6 +4650,7 @@ async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, set
                 window.location.href = '/?logout=1';
             }
         }
+        ${qrWidget.jsBlock}
     </script>
 </body>
 </html>`;
@@ -3944,6 +4677,9 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
     const clashFullUrl = formatSubconverterUrl(config.clashSubUrl, 'clash', rawSubUrl);
     const singboxFullUrl = formatSubconverterUrl(config.singboxSubUrl, 'singbox', rawSubUrl);
     const qxFullConfig = await buildQxSsConfig(url, validSSPath, config);
+    const currentDomain = url.split(':')[0];
+    const previewNodes = await buildAllNodes(config, currentDomain, validSSPath);
+    const qrWidget = renderNodeListAndQrWidget(previewNodes, clashFullUrl, singboxFullUrl, rawSubUrl);
 
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -3952,6 +4688,7 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Workers Service - 后台管理控制台</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -4631,17 +5368,17 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
 
             <!-- 订阅转换后端设置 -->
             <div class="config-card">
-                <h3><i class="fas fa-sync-alt"></i> 订阅转换服务后端地址</h3>
+                <h3><i class="fas fa-sync-alt"></i> 订阅转换引擎设置 <span style="font-size: 0.75rem; background: #4f46e5; color: white; padding: 2px 8px; border-radius: 12px; margin-left: 8px;">默认内置原生直出</span></h3>
                 <div class="form-grid">
                     <div class="form-group">
-                        <label for="cfg-clash-sub">Clash 订阅转换前缀</label>
-                        <input type="text" id="cfg-clash-sub" class="form-input" value="${escHtml(config.clashSubUrl)}">
-                        <span class="form-hint">默认: https://subapi.194216.xyz/sub?target=clash&url=</span>
+                        <label for="cfg-clash-sub">外部 Clash 转换前缀 (留空使用内置双模引擎)</label>
+                        <input type="text" id="cfg-clash-sub" class="form-input" value="${escHtml(config.clashSubUrl)}" placeholder="推荐留空：自动识别 FlClash(Mihomo) 与原版 Clash">
+                        <span class="form-hint">留空走 Worker 原生直出（自动兼容 FlClash 全协议与原版 Clash）；填写则走外部 subconverter</span>
                     </div>
                     <div class="form-group">
-                        <label for="cfg-singbox-sub">Sing-box 订阅转换前缀</label>
-                        <input type="text" id="cfg-singbox-sub" class="form-input" value="${escHtml(config.singboxSubUrl)}">
-                        <span class="form-hint">默认: https://subapi.194216.xyz/sub?target=singbox&url=</span>
+                        <label for="cfg-singbox-sub">外部 Sing-box 转换前缀 (留空使用内置 1.14+ 引擎)</label>
+                        <input type="text" id="cfg-singbox-sub" class="form-input" value="${escHtml(config.singboxSubUrl)}" placeholder="推荐留空：原生适配最新 Sing-box 1.14+ 规范">
+                        <span class="form-hint">留空走 Worker 原生直出（适配 Sing-box 1.14+ 最新语法）；填写则走外部 subconverter</span>
                     </div>
                 </div>
             </div>
@@ -4704,6 +5441,7 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                     <i class="fas fa-paper-plane"></i> 复制 Quantumult X 配置
                 </button>
             </div>
+            ${qrWidget.htmlBlock}
         </div>
         
         <div class="footer">
@@ -4874,6 +5612,7 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                 window.location.href = '/admin?logout=1';
             }
         }
+        ${qrWidget.jsBlock}
     </script>
 </body>
 </html>`;
