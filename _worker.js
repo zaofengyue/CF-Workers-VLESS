@@ -41,6 +41,9 @@ let landingProxy = DEFAULT_CONFIG.landingProxy;
 let landingProxies = [...DEFAULT_CONFIG.landingProxies];
 let yourUUID = DEFAULT_CONFIG.yourUUID;
 let yourUUIDBytes = null;
+let cachedUUIDStr = '';
+let cachedUUIDBytes = null;
+let cachedTrojanHash = '';
 let disablevless = DEFAULT_CONFIG.disablevless;
 let disabletro = DEFAULT_CONFIG.disabletro;
 let disabless = DEFAULT_CONFIG.disabless;
@@ -127,13 +130,13 @@ async function loadConfig(env) {
                 if (kvData.adminPassword) config.adminPassword = String(kvData.adminPassword).trim();
                 else if (kvData.ADMIN) config.adminPassword = String(kvData.ADMIN).trim();
                 if (kvData.subPath !== undefined && kvData.subPath !== null) config.subPath = String(kvData.subPath).trim();
-                if (Array.isArray(kvData.proxyIPs) && kvData.proxyIPs.length > 0) {
+                if (Array.isArray(kvData.proxyIPs)) {
                     config.proxyIPs = kvData.proxyIPs.map(s => String(s).trim()).filter(Boolean);
                     config.proxyIP = config.proxyIPs[0] || '';
-                } else if (kvData.proxyIP) {
+                } else if (kvData.proxyIP !== undefined && kvData.proxyIP !== null) {
                     const servers = String(kvData.proxyIP).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
-                    config.proxyIPs = servers.length > 0 ? servers : [String(kvData.proxyIP).trim()];
-                    config.proxyIP = config.proxyIPs[0] || String(kvData.proxyIP).trim();
+                    config.proxyIPs = servers;
+                    config.proxyIP = servers[0] || '';
                 }
                 if (Array.isArray(kvData.landingProxies)) {
                     config.landingProxies = kvData.landingProxies.map(s => String(s).trim()).filter(Boolean);
@@ -1061,9 +1064,12 @@ async function resolveCfipList(cfipList) {
         const trimmed = String(item).trim();
         if (!trimmed || trimmed.startsWith('//')) continue;
         if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 5000);
             try {
                 const resp = await fetch(trimmed, {
-                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Cloudflare-Worker)' }
+                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Cloudflare-Worker)' },
+                    signal: controller.signal
                 });
                 if (resp.ok) {
                     const text = await resp.text();
@@ -1075,7 +1081,9 @@ async function resolveCfipList(cfipList) {
                     }
                 }
             } catch (err) {
-                // 网络异常跳过或记录
+                // 网络异常或超时自动跳过
+            } finally {
+                clearTimeout(timer);
             }
         } else {
             resolved.push(trimmed);
@@ -1086,7 +1094,8 @@ async function resolveCfipList(cfipList) {
 
 function parsePryAddress(serverStr) {
     if (!serverStr) return null;
-    serverStr = serverStr.trim();
+    serverStr = String(serverStr).split('#')[0].replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+    if (!serverStr) return null;
     // 解析 SSTP (MS-SSTP / SoftEther)
     if (serverStr.startsWith('sstp://')) {
         try {
@@ -1136,14 +1145,15 @@ function parsePryAddress(serverStr) {
         }
     }
     
-    // 解析 HTTP
+    // 解析 HTTP / HTTPS
     if (serverStr.startsWith('http://') || serverStr.startsWith('https://')) {
+        const isHttps = serverStr.startsWith('https://');
         try {
             const url = new URL(serverStr);
             return {
-                type: 'http',
+                type: isHttps ? 'https' : 'http',
                 host: url.hostname,
-                port: parseInt(url.port) || (serverStr.startsWith('https://') ? 443 : 80),
+                port: parseInt(url.port) || (isHttps ? 443 : 80),
                 username: url.username ? decodeURIComponent(url.username) : '',
                 password: url.password ? decodeURIComponent(url.password) : ''
             };
@@ -1273,8 +1283,13 @@ export default {
             const kv = getKV(env);
             const hasKV = !!kv;
 
+            if (config.yourUUID !== cachedUUIDStr) {
+                cachedUUIDStr = config.yourUUID;
+                cachedUUIDBytes = uuidToBytes(config.yourUUID);
+                cachedTrojanHash = await sha224(config.yourUUID);
+            }
             yourUUID = config.yourUUID;
-            yourUUIDBytes = uuidToBytes(config.yourUUID);
+            yourUUIDBytes = cachedUUIDBytes;
             password = config.password;
             subPath = config.subPath;
             proxyIP = config.proxyIP;
@@ -1297,7 +1312,7 @@ export default {
             
             // 1. 后台配置 API: /api/config (需后台管理员密码 ADMIN 鉴权)
             if (pathname === '/api/config') {
-                const reqPassword = url.searchParams.get('password') || request.headers.get('x-password');
+                const reqPassword = url.searchParams.get('password') || request.headers.get('x-password') || getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd');
                 if (reqPassword !== config.adminPassword) {
                     return new Response(JSON.stringify({ success: false, message: '后台管理鉴权失败，密码错误' }), {
                         status: 401,
@@ -1320,14 +1335,19 @@ export default {
                             newCfip = body.cfip.map(s => String(s).trim()).filter(Boolean);
                         }
                         let newProxyIPs = [];
+                        let hasProxyInput = false;
                         if (typeof body.proxyIPs === 'string') {
+                            hasProxyInput = true;
                             newProxyIPs = body.proxyIPs.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
                         } else if (Array.isArray(body.proxyIPs)) {
+                            hasProxyInput = true;
                             newProxyIPs = body.proxyIPs.map(s => String(s).trim()).filter(Boolean);
                         } else if (typeof body.proxyIP === 'string') {
+                            hasProxyInput = true;
                             newProxyIPs = body.proxyIP.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
                         }
-                        const mainProxyIP = newProxyIPs.length > 0 ? newProxyIPs[0] : (body.proxyIP ? String(body.proxyIP).trim() : config.proxyIP);
+                        const finalProxyIPs = hasProxyInput ? newProxyIPs : config.proxyIPs;
+                        const mainProxyIP = finalProxyIPs.length > 0 ? finalProxyIPs[0] : '';
 
                         let newLandingProxies = [];
                         if (typeof body.landingProxies === 'string') {
@@ -1345,7 +1365,7 @@ export default {
                             adminPassword: (body.adminPassword && String(body.adminPassword).trim()) || config.adminPassword,
                             subPath: body.subPath !== undefined ? String(body.subPath).trim() : config.subPath,
                             proxyIP: mainProxyIP,
-                            proxyIPs: newProxyIPs.length > 0 ? newProxyIPs : (mainProxyIP ? [mainProxyIP] : []),
+                            proxyIPs: finalProxyIPs,
                             landingProxy: mainLandingProxy,
                             landingProxies: newLandingProxies,
                             disablevless: body.disablevless === true || body.disablevless === 'true',
@@ -1359,8 +1379,12 @@ export default {
                             singboxSubUrl: (body.singboxSubUrl && String(body.singboxSubUrl).trim()) || config.singboxSubUrl
                         };
                         await saveConfig(env, updatedConfig);
+                        const secureFlag = url.protocol === 'https:' ? '; Secure' : '';
                         return new Response(JSON.stringify({ success: true, message: '配置已成功持久化保存到 Cloudflare KV！' }), {
-                            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                            headers: {
+                                'Content-Type': 'application/json; charset=utf-8',
+                                'Set-Cookie': `cf_admin_pwd=${encodeURIComponent(updatedConfig.adminPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`
+                            }
                         });
                     } catch (err) {
                         return new Response(JSON.stringify({ success: false, message: '保存失败: ' + err.message }), {
@@ -1377,7 +1401,7 @@ export default {
 
             // 2. 后台重置 API: /api/reset (需后台管理员密码 ADMIN 鉴权)
             if (pathname === '/api/reset' && request.method === 'POST') {
-                const reqPassword = url.searchParams.get('password') || request.headers.get('x-password');
+                const reqPassword = url.searchParams.get('password') || request.headers.get('x-password') || getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd');
                 if (reqPassword !== config.adminPassword) {
                     return new Response(JSON.stringify({ success: false, message: '后台管理鉴权失败，密码错误' }), {
                         status: 401,
@@ -1391,55 +1415,37 @@ export default {
                     });
                 }
                 await resetConfig(env);
+                const resetCfg = await loadConfig(env);
+                const secureFlag = url.protocol === 'https:' ? '; Secure' : '';
+                const resetCookie = reqPassword === resetCfg.adminPassword
+                    ? `cf_admin_pwd=${encodeURIComponent(resetCfg.adminPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`
+                    : `cf_admin_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`;
                 return new Response(JSON.stringify({ success: true, message: '已清除 KV 配置，恢复默认设置！' }), {
-                    headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                    headers: {
+                        'Content-Type': 'application/json; charset=utf-8',
+                        'Set-Cookie': resetCookie
+                    }
                 });
             }
 
-            // 3. 路径中 proxyip / fd (分流代理) / ld (落地代理) 处理 (支持 sstp://, turn://, socks5://, http(s)://)
-            let pathProxyIP = null;
-            const proxyIpMatch = pathname.match(/\/(?:proxyip|fd|ld)=((?:sstp|turn|socks5|socks|https|http):\/\/[^\s?&#]+)/i) ||
-                                 pathname.match(/^\/((?:sstp|turn):\/\/[^\s?&#]+)/i) ||
-                                 pathname.match(/\/(?:proxyip|fd|ld)=([^/?&#]+)/i);
-            if (proxyIpMatch) {
-                try {
-                    pathProxyIP = decodeURIComponent(proxyIpMatch[1]).trim();
-                } catch (e) {
-                    // 忽略错误
-                }
-            } else if (pathname.startsWith('/proxyip=')) {
-                try {
-                    pathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
-                } catch (e) {
-                    // 忽略错误
-                }
-            } else if (pathname.startsWith('/fd=')) {
-                try {
-                    pathProxyIP = decodeURIComponent(pathname.substring(4)).trim();
-                } catch (e) {
-                    // 忽略错误
-                }
-            } else if (pathname.startsWith('/ld=')) {
-                try {
-                    pathProxyIP = decodeURIComponent(pathname.substring(4)).trim();
-                } catch (e) {
-                    // 忽略错误
-                }
-            }
-
-            if (pathProxyIP && !request.headers.get('Upgrade')) {
-                config.proxyIP = pathProxyIP;
-                proxyIP = pathProxyIP;
-                return new Response(`set proxyIP/fd/ld to: ${proxyIP}\n\n`, {
-                    headers: { 
-                        'Content-Type': 'text/plain; charset=utf-8',
-                        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-                    },
-                });
-            }
-
-            // 4. WebSocket 连接
+            // 3. WebSocket 连接
             if (request.headers.get('Upgrade') === 'websocket') {
+                // 路径中 proxyip / fd (分流代理) / ld (落地代理) 提取 (支持 sstp://, turn://, socks5://, http(s)://)
+                let pathProxyIP = null;
+                const proxyIpMatch = pathname.match(/\/(?:proxyip|fd|ld)=((?:sstp|turn|socks5|socks|https|http):\/\/[^\s?&#]+)/i) ||
+                                     pathname.match(/^\/((?:sstp|turn):\/\/[^\s?&#]+)/i) ||
+                                     pathname.match(/\/(?:proxyip|fd|ld)=([^/?&#]+)/i);
+                if (proxyIpMatch) {
+                    try {
+                        pathProxyIP = decodeURIComponent(proxyIpMatch[1]).trim();
+                    } catch (e) {}
+                } else if (pathname.startsWith('/proxyip=')) {
+                    try { pathProxyIP = decodeURIComponent(pathname.substring(9)).trim(); } catch (e) {}
+                } else if (pathname.startsWith('/fd=')) {
+                    try { pathProxyIP = decodeURIComponent(pathname.substring(4)).trim(); } catch (e) {}
+                } else if (pathname.startsWith('/ld=')) {
+                    try { pathProxyIP = decodeURIComponent(pathname.substring(4)).trim(); } catch (e) {}
+                }
                 // 1. 标准提取 (从 URL 查询参数或 Headers 中获取)
                 let reqLd = url.searchParams.get('ld') || request.headers.get('ld');
                 let reqFd = url.searchParams.get('fd') || request.headers.get('fd') || url.searchParams.get('proxyip') || request.headers.get('proxyip');
@@ -1508,16 +1514,18 @@ export default {
             } else if (request.method === 'GET') {
                 // 5. 后台管理页面 (/admin - 需 ADMIN 密码验证)
                 if (url.pathname === '/admin' || url.pathname === '/admin/') {
-                    return getAdminPage(request, validSSPath, config, hasKV);
+                    return await getAdminPage(request, validSSPath, config, hasKV);
                 }
 
                 // 6. 前台节点与订阅页面 (/ - 需 PASSWORD 密码验证)
                 if (url.pathname === '/') {
-                    return getNodesPage(request, validSSPath, config, hasKV);
+                    return await getNodesPage(request, validSSPath, config, hasKV);
                 }
                 
-                // 6. 订阅输出
-                if (url.pathname.toLowerCase().includes(`/${config.subPath.toLowerCase()}`)) {
+                // 7. 订阅输出 (精确路径匹配)
+                const cleanReqPath = url.pathname.replace(/\/+$/, '').toLowerCase();
+                const cleanSubPath = `/${config.subPath.replace(/^\/+|\/+$/g, '').toLowerCase()}`;
+                if (cleanReqPath === cleanSubPath) {
                     const currentDomain = url.hostname;
                     const vlsHeader = 'v' + 'l' + 'e' + 's' + 's';
                     const troHeader = 't' + 'r' + 'o' + 'j' + 'a' + 'n';
@@ -1851,9 +1859,33 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                 return;
             }
 
-            // 2. 尝试 Trojan 协议解析
+            // 2. 尝试 VLESS 协议解析 (同步字节比对，0 异步开销)
+            if (!activeConfig.disablevless) {
+                const vlsResult = parseVLsPacketHeader(chunk, activeConfig.yourUUID, yourUUIDBytes);
+                if (!vlsResult.hasError) {
+                    const { addressType, port, hostname, rawIndex, version, isUDP } = vlsResult;
+
+                    if (isSpeedTestSite(hostname)) {
+                        throw new Error('Speedtest site is blocked');
+                    }
+
+                    if (isUDP) {
+                        if (port === 53) isDnsQuery = true;
+                        else throw new Error('UDP is not supported');
+                    }
+                    const respHeader = new Uint8Array([version[0], 0]);
+                    const rawData = chunk.slice(rawIndex);
+                    if (isDnsQuery) return forwardataudp(rawData, serverSock, respHeader);
+                    await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, customProxyIP, request);
+                    if (remoteConnWrapper.socket && !upQueue.empty) await flushUpstream();
+                    return;
+                }
+            }
+
+            // 3. 尝试 Trojan 协议解析 (复用预计算的 SHA-224 哈希)
             if (!activeConfig.disabletro) {
-                const trojanResult = await parsetroHeader(chunk, activeConfig.yourUUID);
+                const expectedHash = (activeConfig.yourUUID === cachedUUIDStr && cachedTrojanHash) ? cachedTrojanHash : null;
+                const trojanResult = await parsetroHeader(chunk, activeConfig.yourUUID, expectedHash);
                 if (!trojanResult.hasError) {
                     isTrojan = true;
                     const { addressType, port, hostname, rawClientData } = trojanResult;
@@ -1867,29 +1899,6 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                     return;
                 }
             }
-            
-            // 3. 尝试 VLESS 协议解析
-            if (!activeConfig.disablevless) {
-                const vlsResult = parseVLsPacketHeader(chunk, activeConfig.yourUUID, yourUUIDBytes);
-                if (!vlsResult.hasError) {
-                const { addressType, port, hostname, rawIndex, version, isUDP } = vlsResult;
-
-                if (isSpeedTestSite(hostname)) {
-                    throw new Error('Speedtest site is blocked');
-                }
-
-                if (isUDP) {
-                    if (port === 53) isDnsQuery = true;
-                    else throw new Error('UDP is not supported');
-                }
-                const respHeader = new Uint8Array([version[0], 0]);
-                const rawData = chunk.slice(rawIndex);
-                if (isDnsQuery) return forwardataudp(rawData, serverSock, respHeader);
-                await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, customProxyIP, request);
-                if (remoteConnWrapper.socket && !upQueue.empty) await flushUpstream();
-                return;
-            }
-        }
 
         throw new Error('Protocol parse error');
         },
@@ -1904,55 +1913,58 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
     });
 }
 
-async function parsetroHeader(buffer, passwordPlainText) {
-  const sha224Password = await sha224(passwordPlainText);
-  
-  if (buffer.byteLength < 56) {
+async function parsetroHeader(buffer, passwordPlainText, precomputedHash = null) {
+  if (!buffer || buffer.byteLength < 64) {
     return { hasError: true, message: "invalid data" };
   }
-  let crLfIndex = 56;
-  if (new Uint8Array(buffer.slice(56, 57))[0] !== 0x0d || new Uint8Array(buffer.slice(57, 58))[0] !== 0x0a) {
+  const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  if (u8[56] !== 0x0d || u8[57] !== 0x0a) {
     return { hasError: true, message: "invalid header format" };
   }
-  const password = new TextDecoder().decode(buffer.slice(0, crLfIndex));
+  const sha224Password = precomputedHash || await sha224(passwordPlainText);
+  const password = dec_ss.decode(u8.subarray(0, 56));
   if (password !== sha224Password) {
     return { hasError: true, message: "invalid password" };
   }
 
-  const socks5DataBuffer = buffer.slice(crLfIndex + 2);
-  if (socks5DataBuffer.byteLength < 6) {
+  const socks5Offset = 58;
+  const socks5Len = u8.byteLength - socks5Offset;
+  if (socks5Len < 8) {
     return { hasError: true, message: "invalid S5 request data" };
   }
 
-  const view = new DataView(socks5DataBuffer);
-  const cmd = view.getUint8(0);
+  const cmd = u8[socks5Offset];
   if (cmd !== 1) {
     return { hasError: true, message: "unsupported command, only TCP is allowed" };
   }
 
-  const atype = view.getUint8(1);
+  const atype = u8[socks5Offset + 1];
   let addressLength = 0;
-  let addressIndex = 2;
+  let addressIndex = socks5Offset + 2;
   let address = "";
   switch (atype) {
     case 1: // IPv4
       addressLength = 4;
-      address = new Uint8Array(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength)).join(".");
+      if (addressIndex + addressLength + 4 > u8.byteLength) return { hasError: true, message: "truncated ipv4 header" };
+      address = u8.subarray(addressIndex, addressIndex + 4).join(".");
       break;
     case 3: // Domain
-      addressLength = new Uint8Array(socks5DataBuffer.slice(addressIndex, addressIndex + 1))[0];
+      addressLength = u8[addressIndex];
       addressIndex += 1;
-      address = new TextDecoder().decode(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength));
+      if (addressIndex + addressLength + 4 > u8.byteLength) return { hasError: true, message: "truncated domain header" };
+      address = dec_ss.decode(u8.subarray(addressIndex, addressIndex + addressLength));
       break;
-    case 4: // IPv6
+    case 4: { // IPv6
       addressLength = 16;
-      const dataView = new DataView(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength));
+      if (addressIndex + addressLength + 4 > u8.byteLength) return { hasError: true, message: "truncated ipv6 header" };
+      const dataView = new DataView(u8.buffer, u8.byteOffset + addressIndex, 16);
       const ipv6 = [];
       for (let i = 0; i < 8; i++) {
         ipv6.push(dataView.getUint16(i * 2).toString(16));
       }
       address = ipv6.join(":");
       break;
+    }
     default:
       return { hasError: true, message: `invalid addressType is ${atype}` };
   }
@@ -1962,15 +1974,16 @@ async function parsetroHeader(buffer, passwordPlainText) {
   }
 
   const portIndex = addressIndex + addressLength;
-  const portBuffer = socks5DataBuffer.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
+  const portRemote = (u8[portIndex] << 8) | u8[portIndex + 1];
+  const rawStart = portIndex + 4;
+  const rawClientData = buffer instanceof Uint8Array ? buffer.subarray(rawStart) : buffer.slice(rawStart);
 
   return {
     hasError: false,
     addressType: atype,
     port: portRemote,
     hostname: address,
-    rawClientData: socks5DataBuffer.slice(portIndex + 4)
+    rawClientData
   };
 }
 
@@ -2028,20 +2041,26 @@ async function connect2Socks5(proxyConfig, targetHost, targetPort, initialData) 
             throw new Error('S5 connection failed');
         }
         
-        await writer.write(initialData);
+        if (initialData && initialData.byteLength > 0) {
+            await writer.write(initialData);
+        }
         writer.releaseLock();
         reader.releaseLock();
         return socket;
     } catch (error) {
-        writer.releaseLock();
-        reader.releaseLock();
+        try { writer.releaseLock(); } catch (e) {}
+        try { reader.releaseLock(); } catch (e) {}
+        closeSocketQuietly(socket);
         throw error;
     }
 }
 
 async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
-    const { host, port, username, password } = proxyConfig;
-    const socket = connect({ hostname: host, port: port });
+    const { type, host, port, username, password } = proxyConfig;
+    const socket = type === 'https'
+        ? connect({ hostname: host, port: port }, { secureTransport: 'on' })
+        : connect({ hostname: host, port: port });
+    await socket.opened;
     const writer = socket.writable.getWriter();
     const reader = socket.readable.getReader();
     try {
@@ -2049,14 +2068,16 @@ async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
         connectRequest += `Host: ${targetHost}:${targetPort}\r\n`;
         
         if (username && password) {
-            const auth = btoa(`${username}:${password}`);
-            connectRequest += `Proxy-Authorization: Basic ${auth}\r\n`;
+            const authBytes = enc_ss.encode(`${username}:${password}`);
+            let binary = '';
+            for (let i = 0; i < authBytes.length; i++) binary += String.fromCharCode(authBytes[i]);
+            connectRequest += `Proxy-Authorization: Basic ${btoa(binary)}\r\n`;
         }
         
         connectRequest += `User-Agent: Mozilla/5.0\r\n`;
-        connectRequest += `Connection: keep-alive\r\n`;
-        connectRequest += '\r\n';
-        await writer.write(new TextEncoder().encode(connectRequest));
+        connectRequest += `Proxy-Connection: keep-alive\r\n`;
+        connectRequest += `Connection: keep-alive\r\n\r\n`;
+        await writer.write(enc_ss.encode(connectRequest));
         let responseBuffer = new Uint8Array(0);
         let headerEndIndex = -1;
         let bytesRead = 0;
@@ -2067,9 +2088,10 @@ async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
             if (done) {
                 throw new Error('Connection closed before receiving HTTP response');
             }
-            const newBuffer = new Uint8Array(responseBuffer.length + value.length);
+            const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+            const newBuffer = new Uint8Array(responseBuffer.length + chunk.length);
             newBuffer.set(responseBuffer);
-            newBuffer.set(value, responseBuffer.length);
+            newBuffer.set(chunk, responseBuffer.length);
             responseBuffer = newBuffer;
             bytesRead = responseBuffer.length;
             
@@ -2086,7 +2108,7 @@ async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
             throw new Error('Invalid HTTP response');
         }
         
-        const headerText = new TextDecoder().decode(responseBuffer.slice(0, headerEndIndex));
+        const headerText = dec_ss.decode(responseBuffer.subarray(0, headerEndIndex));
         const statusLine = headerText.split('\r\n')[0];
         const statusMatch = statusLine.match(/HTTP\/\d\.\d\s+(\d+)/);
         
@@ -2094,17 +2116,43 @@ async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
             throw new Error(`Invalid response: ${statusLine}`);
         }
         
-        const statusCode = parseInt(statusMatch[1]);
+        const statusCode = parseInt(statusMatch[1], 10);
         if (statusCode < 200 || statusCode >= 300) {
             throw new Error(`Connection failed: ${statusLine}`);
         }
         
-        console.log('HTTP connection established for Trojan');
-        
-        await writer.write(initialData);
+        if (initialData && initialData.byteLength > 0) {
+            await writer.write(initialData);
+        }
         writer.releaseLock();
+
+        const extraData = responseBuffer.subarray(headerEndIndex);
+        if (extraData.byteLength > 0) {
+            const extraCopy = extraData.slice();
+            const wrappedReadable = new ReadableStream({
+                start(c) {
+                    c.enqueue(extraCopy);
+                },
+                pull(c) {
+                    return reader.read().then(({ done, value }) => {
+                        if (done) c.close();
+                        else c.enqueue(value instanceof Uint8Array ? value : new Uint8Array(value));
+                    });
+                },
+                cancel() {
+                    reader.cancel().catch(() => {});
+                    closeSocketQuietly(socket);
+                }
+            });
+            return {
+                readable: wrappedReadable,
+                writable: socket.writable,
+                close: () => closeSocketQuietly(socket),
+                closed: socket.closed
+            };
+        }
+
         reader.releaseLock();
-        
         return socket;
     } catch (error) {
         try { 
@@ -2765,12 +2813,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         proxyConfig = parsePryAddress(customProxyIP);
         if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn')) {
             shouldUseProxy = true;
-        } else if (!proxyConfig) {
-            proxyConfig = parsePryAddress(landingProxy || proxyIP) || { type: 'direct', host: (landingProxy || proxyIP), port: 443 };
+        } else if (!proxyConfig && (landingProxy || proxyIP)) {
+            const fb = (landingProxy || proxyIP).split('#')[0].trim();
+            if (fb) proxyConfig = parsePryAddress(fb) || { type: 'direct', host: fb, port: 443 };
         }
     } else {
         // 全局落地代理优先
-        const effectiveLanding = (Array.isArray(landingProxies) && landingProxies.length > 0) ? landingProxies[0] : landingProxy;
+        const rawLanding = (Array.isArray(landingProxies) && landingProxies.length > 0) ? landingProxies[0] : landingProxy;
+        const effectiveLanding = rawLanding ? rawLanding.split('#')[0].replace(/^(?:ld|fd|proxyip)=/i, '').trim() : '';
         if (effectiveLanding) {
             proxyConfig = parsePryAddress(effectiveLanding);
             if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn')) {
@@ -2778,15 +2828,21 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
             }
         }
         // 未配置落地代理时，才生效反代
-        if (!proxyConfig && proxyIP) {
-            proxyConfig = parsePryAddress(proxyIP) || { type: 'direct', host: proxyIP, port: 443 };
+        const cleanProxyIP = proxyIP ? proxyIP.split('#')[0].replace(/^(?:ld|fd|proxyip)=/i, '').trim() : '';
+        if (!proxyConfig && cleanProxyIP) {
+            proxyConfig = parsePryAddress(cleanProxyIP) || { type: 'direct', host: cleanProxyIP, port: 443 };
             if (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn') {
                 shouldUseProxy = true;
             }
         }
     }
     
+    const hasFallbackProxy = !!(proxyConfig && proxyConfig.host);
+
     async function connecttoPry() {
+        if (!proxyConfig || !proxyConfig.host) {
+            throw new Error('Direct connection failed and no fallback proxy configured');
+        }
         let newSocket;
         if (proxyConfig.type === 'socks5') {
             newSocket = await connect2Socks5(proxyConfig, host, portNum, rawData);
@@ -2806,58 +2862,64 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
     }
     
     if (shouldUseProxy) {
-        try {
-            await connecttoPry();
-        } catch (err) {
-            throw err;
-        }
+        await connecttoPry();
     } else {
         try {
             const initialSocket = await connectDirect(host, portNum, rawData, GRAIN_CFG.concur);
             remoteConnWrapper.socket = initialSocket;
-            connectStreams(initialSocket, ws, respHeader, connecttoPry, ssInstance);
+            connectStreams(initialSocket, ws, respHeader, hasFallbackProxy ? connecttoPry : null, ssInstance);
         } catch (err) {
             remoteConnWrapper.socket = null;
-            await connecttoPry();
+            if (hasFallbackProxy) {
+                await connecttoPry();
+            } else {
+                throw err;
+            }
         }
     }
 }
 
 function parseVLsPacketHeader(chunk, token, tokenBytes) {
-    if (chunk.byteLength < 24) return { hasError: true, message: 'Invalid data' };
-    const version = new Uint8Array(chunk.slice(0, 1));
-    const chunkView = new Uint8Array(chunk);
+    if (!chunk || chunk.byteLength < 24) return { hasError: true, message: 'Invalid data' };
+    const chunkView = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+    const version = chunkView.subarray(0, 1);
     if (tokenBytes) {
         if (!matchUUID(chunkView, 1, tokenBytes)) return { hasError: true, message: 'Invalid uuid' };
     } else {
         if (formatIdentifier(chunkView.slice(1, 17)) !== token) return { hasError: true, message: 'Invalid uuid' };
     }
     const optLen = chunkView[17];
+    if (chunkView.byteLength < 22 + optLen) return { hasError: true, message: 'Truncated VLESS header' };
     const cmd = chunkView[18 + optLen];
     let isUDP = false;
     if (cmd === 1) {} else if (cmd === 2) { isUDP = true; } else { return { hasError: true, message: 'Invalid command' }; }
     const portIdx = 19 + optLen;
-    const port = new DataView(chunk.slice(portIdx, portIdx + 2)).getUint16(0);
+    const port = (chunkView[portIdx] << 8) | chunkView[portIdx + 1];
     let addrIdx = portIdx + 2, addrLen = 0, addrValIdx = addrIdx + 1, hostname = '';
     const addressType = chunkView[addrIdx];
     switch (addressType) {
-        case 1: 
-            addrLen = 4; 
-            hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.'); 
+        case 1:
+            addrLen = 4;
+            if (addrValIdx + addrLen > chunkView.byteLength) return { hasError: true, message: 'Truncated IPv4' };
+            hostname = chunkView.subarray(addrValIdx, addrValIdx + 4).join('.');
             break;
-        case 2: 
-            addrLen = chunkView[addrValIdx]; 
-            addrValIdx += 1; 
-            hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
+        case 2:
+            if (addrValIdx >= chunkView.byteLength) return { hasError: true, message: 'Truncated domain len' };
+            addrLen = chunkView[addrValIdx];
+            addrValIdx += 1;
+            if (addrValIdx + addrLen > chunkView.byteLength) return { hasError: true, message: 'Truncated domain' };
+            hostname = dec_ss.decode(chunkView.subarray(addrValIdx, addrValIdx + addrLen));
             break;
-        case 3: 
-            addrLen = 16; 
-            const ipv6 = []; 
-            const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
-            for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16)); 
-            hostname = ipv6.join(':'); 
+        case 3: {
+            addrLen = 16;
+            if (addrValIdx + addrLen > chunkView.byteLength) return { hasError: true, message: 'Truncated IPv6' };
+            const ipv6 = [];
+            const ipv6View = new DataView(chunkView.buffer, chunkView.byteOffset + addrValIdx, 16);
+            for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
+            hostname = ipv6.join(':');
             break;
-        default: 
+        }
+        default:
             return { hasError: true, message: `Invalid address type: ${addressType}` };
     }
     if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
@@ -3065,17 +3127,70 @@ async function forwardataudp(udpChunk, webSocket, respHeader, ssInstance) {
  * @param {boolean} hasKV
  * @returns {Response}
  */
-function getNodesPage(request, validSSPath, config, hasKV) {
-	const url = request.headers.get('Host');
+function escHtml(str) {
+    return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function escJsStr(val) {
+    return JSON.stringify(String(val ?? '')).replace(/<\//g, '<\\/');
+}
+
+function getCookieValue(cookieHeader, name) {
+    if (!cookieHeader) return null;
+    const parts = cookieHeader.split(';');
+    for (const part of parts) {
+        const eqIdx = part.indexOf('=');
+        if (eqIdx === -1) continue;
+        const k = part.substring(0, eqIdx).trim();
+        if (k === name) {
+            try { return decodeURIComponent(part.substring(eqIdx + 1).trim()); } catch (e) { return part.substring(eqIdx + 1).trim(); }
+        }
+    }
+    return null;
+}
+
+async function buildQxSsConfig(url, validSSPath, config) {
+    const method = config.ssMethod || 'aes-256-gcm';
+    const methodInfo = C_SS[method] || C_SS['aes-256-gcm'];
+    const rawSecret = config.ssPsk || config.password || config.yourUUID;
+    const effectivePwd = methodInfo.b3 ? await deriveSS_Psk(rawSecret, methodInfo.k) : rawSecret;
+    let qxHostPort = 'www.visa.com.tw:443';
+    if (Array.isArray(config.cfip) && config.cfip.length > 0) {
+        const firstStatic = config.cfip.map(s => String(s).trim()).find(s => s && !s.startsWith('http://') && !s.startsWith('https://') && !s.startsWith('//'));
+        if (firstStatic) {
+            const cleanItem = firstStatic.split('#')[0].trim();
+            if (cleanItem.startsWith('[') && cleanItem.includes(']:')) {
+                qxHostPort = cleanItem;
+            } else if (cleanItem.includes(':')) {
+                qxHostPort = cleanItem;
+            } else if (cleanItem) {
+                qxHostPort = `${cleanItem}:443`;
+            }
+        }
+    }
+    return `shadowsocks=${qxHostPort},method=${method},password=${effectivePwd},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=Workers-SS`;
+}
+
+async function getNodesPage(request, validSSPath, config, hasKV) {
+	const url = request.headers.get('Host') || new URL(request.url).host;
 	const baseUrl = `https://${url}`;
 	const urlObj = new URL(request.url);
+	const secureFlag = urlObj.protocol === 'https:' ? '; Secure' : '';
+	if (urlObj.searchParams.get('logout') === '1') {
+		return getLoginPage(url, baseUrl, false, false, `cf_user_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`);
+	}
 	const providedPassword = urlObj.searchParams.get('password');
-	if (providedPassword) {
+	if (providedPassword !== null) {
 		if (providedPassword === config.password) {
-			return getNodesPageContent(url, baseUrl, validSSPath, config, hasKV);
+			const setCookie = `cf_user_pwd=${encodeURIComponent(providedPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`;
+			return await getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie);
 		} else {
 			return getLoginPage(url, baseUrl, true, false);
 		}
+	}
+	const cookiePassword = getCookieValue(request.headers.get('Cookie'), 'cf_user_pwd');
+	if (cookiePassword && cookiePassword === config.password) {
+		return await getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, null);
 	}
 	return getLoginPage(url, baseUrl, false, false);
 }
@@ -3086,19 +3201,28 @@ function getNodesPage(request, validSSPath, config, hasKV) {
  * @param {string} validSSPath
  * @param {object} config
  * @param {boolean} hasKV
- * @returns {Response}
+ * @returns {Promise<Response>}
  */
-function getAdminPage(request, validSSPath, config, hasKV) {
-	const url = request.headers.get('Host');
+async function getAdminPage(request, validSSPath, config, hasKV) {
+	const url = request.headers.get('Host') || new URL(request.url).host;
 	const baseUrl = `https://${url}`;
 	const urlObj = new URL(request.url);
+	const secureFlag = urlObj.protocol === 'https:' ? '; Secure' : '';
+	if (urlObj.searchParams.get('logout') === '1') {
+		return getLoginPage(url, baseUrl, false, true, `cf_admin_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`);
+	}
 	const providedPassword = urlObj.searchParams.get('password');
-	if (providedPassword) {
+	if (providedPassword !== null) {
 		if (providedPassword === config.adminPassword) {
-			return getAdminPageContent(url, baseUrl, validSSPath, config, hasKV);
+			const setCookie = `cf_admin_pwd=${encodeURIComponent(providedPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`;
+			return await getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie);
 		} else {
 			return getLoginPage(url, baseUrl, true, true);
 		}
+	}
+	const cookiePassword = getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd');
+	if (cookiePassword && cookiePassword === config.adminPassword) {
+		return await getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, null);
 	}
 	return getLoginPage(url, baseUrl, false, true);
 }
@@ -3111,7 +3235,7 @@ function getAdminPage(request, validSSPath, config, hasKV) {
  * @param {boolean} isAdmin
  * @returns {Response}
  */
-function getLoginPage(url, baseUrl, showError = false, isAdmin = false) {
+function getLoginPage(url, baseUrl, showError = false, isAdmin = false, setCookie = null) {
     const title = isAdmin ? 'Workers Service - 后台管理登录' : 'Workers Service - 节点与订阅登录';
     const subtitle = isAdmin ? '请输入后台管理密码 (ADMIN) 以访问管理控制台' : '请输入访问密码 (PASSWORD) 查看节点与订阅';
 
@@ -3290,10 +3414,17 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false) {
     </div>
     
     <script>
+        if (window.location.search.includes('logout=') || window.location.search.includes('password=')) {
+            const cleanUrl = new URL(window.location);
+            cleanUrl.searchParams.delete('logout');
+            cleanUrl.searchParams.delete('password');
+            window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search);
+        }
         function handleLogin(event) {
             event.preventDefault();
             const password = document.getElementById('password').value;
             const currentUrl = new URL(window.location);
+            currentUrl.searchParams.delete('logout');
             currentUrl.searchParams.set('password', password);
             window.location.href = currentUrl.toString();
         }
@@ -3301,13 +3432,12 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false) {
 </body>
 </html>`;
 
-	return new Response(html, {
-		status: 200,
-		headers: {
-			'Content-Type': 'text/html;charset=utf-8',
-			'Cache-Control': 'no-cache, no-store, must-revalidate',
-		},
-	});
+	const respHeaders = {
+		'Content-Type': 'text/html;charset=utf-8',
+		'Cache-Control': 'no-cache, no-store, must-revalidate',
+	};
+	if (setCookie) respHeaders['Set-Cookie'] = setCookie;
+	return new Response(html, { status: 200, headers: respHeaders });
 }
 
 /**
@@ -3338,13 +3468,11 @@ function formatSubconverterUrl(prefix, target, rawUrl) {
     return `${cleanPrefix}/sub?target=${target}&url=${encodedRaw}&insert=false`;
 }
 
-function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
+async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie = null) {
     const rawSubUrl = `${baseUrl}/${config.subPath}`;
     const clashFullUrl = formatSubconverterUrl(config.clashSubUrl, 'clash', rawSubUrl);
     const singboxFullUrl = formatSubconverterUrl(config.singboxSubUrl, 'singbox', rawSubUrl);
-    const ssMethod = config.ssMethod || 'aes-256-gcm';
-    const ssEffectivePwd = config.ssPsk || config.password || config.yourUUID;
-    const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${ssEffectivePwd},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
+    const qxFullConfig = await buildQxSsConfig(url, validSSPath, config);
 
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -3747,22 +3875,22 @@ function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
         }
 
         function copySubscription() {
-            const configUrl = '${baseUrl}/${config.subPath}';
+            const configUrl = ${escJsStr(`${baseUrl}/${config.subPath}`)};
             copyText(configUrl, '全协议订阅链接已复制到剪贴板!');
         }
         
         function copyClashSubscription() {
-            const clashUrl = '${clashFullUrl}';
+            const clashUrl = ${escJsStr(clashFullUrl)};
             copyText(clashUrl, 'Clash 订阅链接已复制到剪贴板!');
         }
         
         function copySingboxSubscription() {
-            const singboxUrl = '${singboxFullUrl}';
+            const singboxUrl = ${escJsStr(singboxFullUrl)};
             copyText(singboxUrl, 'Sing-box 订阅链接已复制到剪贴板!');
         }
         
         function copyQXConfig() {
-            const qx = '${qxFullConfig}';
+            const qx = ${escJsStr(qxFullConfig)};
             copyText(qx, 'Quantumult X 配置已复制!');
         }
 
@@ -3780,24 +3908,26 @@ function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
             });
         }
         
+        if (window.location.search.includes('password=')) {
+            const cleanUrl = new URL(window.location);
+            cleanUrl.searchParams.delete('password');
+            window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search);
+        }
         function logout() {
             if (confirm('确定要退出登录吗?')) {
-                const currentUrl = new URL(window.location);
-                currentUrl.searchParams.delete('password');
-                window.location.href = currentUrl.toString();
+                window.location.href = '/?logout=1';
             }
         }
     </script>
 </body>
 </html>`;
 
-	return new Response(html, {
-		status: 200,
-		headers: {
-			'Content-Type': 'text/html;charset=utf-8',
-			'Cache-Control': 'no-cache, no-store, must-revalidate',
-		},
-	});
+	const respHeaders = {
+		'Content-Type': 'text/html;charset=utf-8',
+		'Cache-Control': 'no-cache, no-store, must-revalidate',
+	};
+	if (setCookie) respHeaders['Set-Cookie'] = setCookie;
+	return new Response(html, { status: 200, headers: respHeaders });
 }
 
 /**
@@ -3809,13 +3939,11 @@ function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV) {
  * @param {boolean} hasKV
  * @returns {Response}
  */
-function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
+async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie = null) {
     const rawSubUrl = `${baseUrl}/${config.subPath}`;
     const clashFullUrl = formatSubconverterUrl(config.clashSubUrl, 'clash', rawSubUrl);
     const singboxFullUrl = formatSubconverterUrl(config.singboxSubUrl, 'singbox', rawSubUrl);
-    const ssMethod = config.ssMethod || 'aes-256-gcm';
-    const ssEffectivePwd = config.ssPsk || config.password || config.yourUUID;
-    const qxFullConfig = `shadowsocks=mfa.gov.ua:443,method=${ssMethod},password=${ssEffectivePwd},obfs=wss,obfs-host=${url},obfs-uri=${validSSPath}/?ed=2560,fast-open=true,udp-relay=true,tag=SS`;
+    const qxFullConfig = await buildQxSsConfig(url, validSSPath, config);
 
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -4384,27 +4512,27 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 <div class="form-grid">
                     <div class="form-group">
                         <label for="cfg-admin-password">后台管理密码 (ADMIN)</label>
-                        <input type="text" id="cfg-admin-password" class="form-input" value="${config.adminPassword}" placeholder="后台管理密码">
+                        <input type="text" id="cfg-admin-password" class="form-input" value="${escHtml(config.adminPassword)}" placeholder="后台管理密码">
                         <span class="form-hint">进入此 /admin 后台管理面板的密码</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-password">前台访问密码 (PASSWORD)</label>
-                        <input type="text" id="cfg-password" class="form-input" value="${config.password}" placeholder="前台页面密码">
+                        <input type="text" id="cfg-password" class="form-input" value="${escHtml(config.password)}" placeholder="前台页面密码">
                         <span class="form-hint">用户访问首页 / 查看节点订阅所用的密码</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-uuid">用户 UUID</label>
-                        <input type="text" id="cfg-uuid" class="form-input" value="${config.yourUUID}" placeholder="客户端连接使用的 UUID">
+                        <input type="text" id="cfg-uuid" class="form-input" value="${escHtml(config.yourUUID)}" placeholder="客户端连接使用的 UUID">
                         <span class="form-hint">VLESS / Trojan / Shadowsocks 鉴权 UUID</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-subpath">节点订阅路径 (SUB_PATH)</label>
-                        <input type="text" id="cfg-subpath" class="form-input" value="${config.subPath}" placeholder="如 link 或自定义字符串">
-                        <span class="form-hint">客户端订阅获取路径 /${config.subPath}</span>
+                        <input type="text" id="cfg-subpath" class="form-input" value="${escHtml(config.subPath)}" placeholder="如 link 或自定义字符串">
+                        <span class="form-hint">客户端订阅获取路径 /${escHtml(config.subPath)}</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-sspath">Shadowsocks 验证路径 (SSPATH)</label>
-                        <input type="text" id="cfg-sspath" class="form-input" value="${config.SSpath}" placeholder="留空则默认使用 UUID">
+                        <input type="text" id="cfg-sspath" class="form-input" value="${escHtml(config.SSpath)}" placeholder="留空则默认使用 UUID">
                         <span class="form-hint">SS 节点 WebSocket 路径鉴权，留空使用 UUID</span>
                     </div>
                     <div class="form-group">
@@ -4431,7 +4559,7 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                     </div>
                     <div class="form-group">
                         <label for="cfg-sspsk">Shadowsocks 2022 预共享密钥 (SS_PSK)</label>
-                        <input type="text" id="cfg-sspsk" class="form-input" value="${config.ssPsk || ''}" placeholder="Base64 编码 PSK，留空则由密码/UUID自动派生">
+                        <input type="text" id="cfg-sspsk" class="form-input" value="${escHtml(config.ssPsk || '')}" placeholder="Base64 编码 PSK，留空则由密码/UUID自动派生">
                         <span class="form-hint">Shadowsocks 2022 模式下的预共享密钥，留空自动生成</span>
                     </div>
                 </div>
@@ -4474,11 +4602,11 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
 
             <!-- 全局落地代理设置 (优先级最高) -->
             <div class="config-card">
-                <h3><i class="fas fa-network-wired"></i> 全局落地代理设置 (SOCKS5 / HTTP / SSTP / TURN) <span style="font-size: 0.75rem; background: #10b981; color: white; padding: 2px 8px; border-radius: 12px; margin-left: 8px;">最高优先级</span></h3>
+                <h3><i class="fas fa-network-wired"></i> 全局落地代理设置 (SOCKS5 / HTTP(S) / SSTP / TURN) <span style="font-size: 0.75rem; background: #10b981; color: white; padding: 2px 8px; border-radius: 12px; margin-left: 8px;">最高优先级</span></h3>
                 <div class="form-group">
                     <label for="cfg-landing-proxy">落地代理列表 (每行一个，支持 #备注名；一旦配置强制走落地代理，反代自动挂起失效)</label>
-                    <textarea id="cfg-landing-proxy" class="form-textarea" rows="4" placeholder="支持每行一个，支持 #备注名，例如：&#10;socks5://user:pass@1.2.3.4:1080#香港S5&#10;http://user:pass@5.6.7.8:8080#日本HTTP&#10;sstp://vpn:vpn@domain:443#美国SSTP&#10;turn://user:pass@domain:3478#德国TURN">${Array.isArray(config.landingProxies) && config.landingProxies.length > 0 ? config.landingProxies.join('\n') : (config.landingProxy || '')}</textarea>
-                    <span class="form-hint">支持协议：<code>socks5://user:pass@host:port#备注</code>、<code>http://user:pass@host:port#备注</code>、<code>sstp://host:port#备注</code>、<code>turn://user:pass@host:port#备注</code><br><strong>优先级最高</strong>：一旦填写了全局落地代理，所有出站流量均强制走落地代理；与下方反代互斥，仅会生效其中一个。</span>
+                    <textarea id="cfg-landing-proxy" class="form-textarea" rows="4" placeholder="支持每行一个，支持 #备注名，例如：&#10;socks5://user:pass@1.2.3.4:1080#香港S5&#10;http://user:pass@5.6.7.8:8080#日本HTTP&#10;https://user:pass@domain:443#新加坡HTTPS(需有效域名证书)&#10;sstp://vpn:vpn@domain:443#美国SSTP&#10;turn://user:pass@domain:3478#德国TURN">${escHtml(Array.isArray(config.landingProxies) && config.landingProxies.length > 0 ? config.landingProxies.join('\n') : (config.landingProxy || ''))}</textarea>
+                    <span class="form-hint">支持协议：<code>socks5://user:pass@host:port#备注</code>、<code>http://...</code>、<code>https://user:pass@domain:port#备注</code>（需有效域名证书且勿开CF小黄云）、<code>sstp://...</code>、<code>turn://...</code><br><strong>优先级最高</strong>：一旦填写了全局落地代理，所有出站流量均强制走落地代理；与下方反代互斥，仅会生效其中一个。</span>
                 </div>
             </div>
 
@@ -4487,7 +4615,7 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 <h3><i class="fas fa-server"></i> 分流反代设置 (Proxy IP) <span style="font-size: 0.75rem; background: #64748b; color: white; padding: 2px 8px; border-radius: 12px; margin-left: 8px;">备用出站</span></h3>
                 <div class="form-group">
                     <label for="cfg-proxyip">反代列表 (仅当未配置上述全局落地代理时生效，支持 #备注名)</label>
-                    <textarea id="cfg-proxyip" class="form-textarea" rows="3" placeholder="支持每行一个，支持 #备注名，例如：&#10;ProxyIP.CMLiussss.net#默认反代&#10;1.2.3.4:443#香港反代">${Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0 ? config.proxyIPs.join('\n') : (config.proxyIP || '')}</textarea>
+                    <textarea id="cfg-proxyip" class="form-textarea" rows="3" placeholder="支持每行一个，支持 #备注名，例如：&#10;ProxyIP.CMLiussss.net#默认反代&#10;1.2.3.4:443#香港反代">${escHtml(Array.isArray(config.proxyIPs) && config.proxyIPs.length > 0 ? config.proxyIPs.join('\n') : (config.proxyIP || ''))}</textarea>
                     <span class="form-hint">支持：<code>IP:端口#备注</code>、<code>域名:端口#备注</code>。<strong>仅在未配置全局落地代理时生效</strong>。用于 CDN 回源反代。</span>
                 </div>
             </div>
@@ -4496,7 +4624,7 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
             <div class="config-card">
                 <h3><i class="fas fa-bolt"></i> 优选 CDN 域名、IP 列表或远程订阅链接 (每行一个)</h3>
                 <div class="form-group">
-                    <textarea id="cfg-cfip" class="form-textarea" rows="7" placeholder="默认为空（未填写时自动使用 www.visa.com.tw 优选）。&#10;如需自定义，格式支持:&#10;优选域名:端口#名称&#10;优选IP:端口#名称&#10;[IPv6]:端口#名称&#10;https://... (远程文本订阅链接)">${(Array.isArray(config.cfip) && !(config.cfip.length === 1 && config.cfip[0] === 'www.visa.com.tw')) ? config.cfip.join('\n') : ''}</textarea>
+                    <textarea id="cfg-cfip" class="form-textarea" rows="7" placeholder="默认为空（未填写时自动使用 www.visa.com.tw 优选）。&#10;如需自定义，格式支持:&#10;优选域名:端口#名称&#10;优选IP:端口#名称&#10;[IPv6]:端口#名称&#10;https://... (远程文本订阅链接)">${escHtml((Array.isArray(config.cfip) && !(config.cfip.length === 1 && config.cfip[0] === 'www.visa.com.tw')) ? config.cfip.join('\n') : '')}</textarea>
                     <span class="form-hint">默认为空，出站自动使用 <code>www.visa.com.tw</code>。若填写了自定义优选节点，则优先使用填写的节点。支持 <code>域名:端口#名称</code>、<code>IP:端口#名称</code>，或 <code>https://...</code> 远程订阅链接。</span>
                 </div>
             </div>
@@ -4507,12 +4635,12 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                 <div class="form-grid">
                     <div class="form-group">
                         <label for="cfg-clash-sub">Clash 订阅转换前缀</label>
-                        <input type="text" id="cfg-clash-sub" class="form-input" value="${config.clashSubUrl}">
+                        <input type="text" id="cfg-clash-sub" class="form-input" value="${escHtml(config.clashSubUrl)}">
                         <span class="form-hint">默认: https://subapi.194216.xyz/sub?target=clash&url=</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-singbox-sub">Sing-box 订阅转换前缀</label>
-                        <input type="text" id="cfg-singbox-sub" class="form-input" value="${config.singboxSubUrl}">
+                        <input type="text" id="cfg-singbox-sub" class="form-input" value="${escHtml(config.singboxSubUrl)}">
                         <span class="form-hint">默认: https://subapi.194216.xyz/sub?target=singbox&url=</span>
                     </div>
                 </div>
@@ -4601,7 +4729,7 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
     </div>
     
     <script>
-        let currentAdminPassword = '${config.adminPassword}';
+        let currentAdminPassword = ${escJsStr(config.adminPassword)};
 
         function switchTab(tabName) {
             document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
@@ -4672,9 +4800,6 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
                     showToast(res.message || '配置已成功保存到 KV！');
                     if (newAdminPwd && newAdminPwd !== currentAdminPassword) {
                         currentAdminPassword = newAdminPwd;
-                        const newUrl = new URL(window.location);
-                        newUrl.searchParams.set('password', newAdminPwd);
-                        window.history.replaceState({}, '', newUrl.toString());
                     }
                     setTimeout(() => { window.location.reload(); }, 1200);
                 } else {
@@ -4706,22 +4831,22 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
         }
         
         function copySubscription() {
-            const configUrl = '${baseUrl}/${config.subPath}';
+            const configUrl = ${escJsStr(`${baseUrl}/${config.subPath}`)};
             copyText(configUrl, '全协议订阅链接已复制到剪贴板!');
         }
         
         function copyClashSubscription() {
-            const clashUrl = '${clashFullUrl}';
+            const clashUrl = ${escJsStr(clashFullUrl)};
             copyText(clashUrl, 'Clash 订阅链接已复制到剪贴板!');
         }
         
         function copySingboxSubscription() {
-            const singboxUrl = '${singboxFullUrl}';
+            const singboxUrl = ${escJsStr(singboxFullUrl)};
             copyText(singboxUrl, 'Sing-box 订阅链接已复制到剪贴板!');
         }
         
         function copyQXConfig() {
-            const qx = '${qxFullConfig}';
+            const qx = ${escJsStr(qxFullConfig)};
             copyText(qx, 'Quantumult X 配置已复制!');
         }
 
@@ -4739,22 +4864,24 @@ function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV) {
             });
         }
         
+        if (window.location.search.includes('password=')) {
+            const cleanUrl = new URL(window.location);
+            cleanUrl.searchParams.delete('password');
+            window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search);
+        }
         function logout() {
             if (confirm('确定要退出管理面板吗?')) {
-                const currentUrl = new URL(window.location);
-                currentUrl.searchParams.delete('password');
-                window.location.href = currentUrl.toString();
+                window.location.href = '/admin?logout=1';
             }
         }
     </script>
 </body>
 </html>`;
 
-	return new Response(html, {
-		status: 200,
-		headers: {
-			'Content-Type': 'text/html;charset=utf-8',
-			'Cache-Control': 'no-cache, no-store, must-revalidate',
-		},
-	});
+	const respHeaders = {
+		'Content-Type': 'text/html;charset=utf-8',
+		'Cache-Control': 'no-cache, no-store, must-revalidate',
+	};
+	if (setCookie) respHeaders['Set-Cookie'] = setCookie;
+	return new Response(html, { status: 200, headers: respHeaders });
 }
